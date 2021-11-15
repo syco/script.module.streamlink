@@ -5,23 +5,33 @@ import re
 import struct
 import time
 import uuid
-
 from base64 import urlsafe_b64encode
 from binascii import unhexlify
 
-from Cryptodome.Cipher import AES
-
+from Crypto.Cipher import AES
 from requests import Response
 from requests.adapters import BaseAdapter
 
 from streamlink.exceptions import NoStreamsError
-from streamlink.plugin import Plugin
-from streamlink.plugin.api import useragents
-from streamlink.plugin.api import validate
-from streamlink.stream import HLSStream
+from streamlink.plugin import Plugin, pluginmatcher
+from streamlink.plugin.api import useragents, validate
+from streamlink.stream.hls import HLSStream, HLSStreamReader, HLSStreamWriter
 from streamlink.utils.url import update_qsd
 
 log = logging.getLogger(__name__)
+
+
+class AbemaTVHLSStreamWriter(HLSStreamWriter):
+    def should_filter_sequence(self, sequence):
+        return "/tsad/" in sequence.segment.uri or super().should_filter_sequence(sequence)
+
+
+class AbemaTVHLSStreamReader(HLSStreamReader):
+    __writer__ = AbemaTVHLSStreamWriter
+
+
+class AbemaTVHLSStream(HLSStream):
+    __reader__ = AbemaTVHLSStreamReader
 
 
 class AbemaTVLicenseAdapter(BaseAdapter):
@@ -37,16 +47,16 @@ class AbemaTVLicenseAdapter(BaseAdapter):
 
     _LICENSE_API = "https://license.abema.io/abematv-hls"
 
-    _MEDIATOKEN_SCHEMA = validate.Schema({u"token": validate.text})
+    _MEDIATOKEN_SCHEMA = validate.Schema({"token": validate.text})
 
-    _LICENSE_SCHEMA = validate.Schema({u"k": validate.text,
-                                       u"cid": validate.text})
+    _LICENSE_SCHEMA = validate.Schema({"k": validate.text,
+                                       "cid": validate.text})
 
     def __init__(self, session, deviceid, usertoken):
         self._session = session
         self.deviceid = deviceid
         self.usertoken = usertoken
-        super(AbemaTVLicenseAdapter, self).__init__()
+        super().__init__()
 
     def _get_videokey_from_ticket(self, ticket):
         params = {
@@ -104,20 +114,16 @@ class AbemaTVLicenseAdapter(BaseAdapter):
         return
 
 
+@pluginmatcher(re.compile(r"""
+    https?://abema\.tv/(
+        now-on-air/(?P<onair>[^?]+)
+        |
+        video/episode/(?P<episode>[^?]+)
+        |
+        channels/.+?/slots/(?P<slots>[^?]+)
+    )
+""", re.VERBOSE))
 class AbemaTV(Plugin):
-    '''
-    Abema.tv https://abema.tv/
-    Note: Streams are geo-restricted to Japan
-
-    '''
-    _url_re = re.compile(r"""https://abema\.tv/(
-        now-on-air/(?P<onair>[^\?]+)
-        |
-        video/episode/(?P<episode>[^\?]+)
-        |
-        channels/.+?/slots/(?P<slots>[^\?]+)
-        )""", re.VERBOSE)
-
     _CHANNEL = "https://api.abema.io/v1/channels"
 
     _USER_API = "https://api.abema.io/v1/users"
@@ -134,28 +140,21 @@ class AbemaTV(Plugin):
                  b"Rbp5KwY4hEmcj5#fykMjJ=AuWz5GSMY-d@H7DMEh3M@9n2G552Us$$"
                  b"k9cD=3TxwWe86!x#Zyhe")
 
-    _USER_SCHEMA = validate.Schema({u"profile": {u"userId": validate.text},
-                                    u"token": validate.text})
+    _USER_SCHEMA = validate.Schema({"profile": {"userId": validate.text},
+                                    "token": validate.text})
 
-    _CHANNEL_SCHEMA = validate.Schema({u"channels": [{u"id": validate.text,
+    _CHANNEL_SCHEMA = validate.Schema({"channels": [{"id": validate.text,
                                       "name": validate.text,
-                                       "playback": {validate.optional(u"dash"):
+                                       "playback": {validate.optional("dash"):
                                                     validate.text,
-                                                    u"hls": validate.text}}]})
+                                                    "hls": validate.text}}]})
 
-    _PRGM_SCHEMA = validate.Schema({u"label": {validate.optional(u"free"): bool
-                                               }})
+    _PRGM_SCHEMA = validate.Schema({"terms": [{validate.optional("onDemandType"): int}]})
 
-    _SLOT_SCHEMA = validate.Schema({u"slot": {u"flags": {
-                                    validate.optional("timeshiftFree"): bool}}}
-                                   )
-
-    @classmethod
-    def can_handle_url(cls, url):
-        return cls._url_re.match(url) is not None
+    _SLOT_SCHEMA = validate.Schema({"slot": {"flags": {validate.optional("timeshiftFree"): bool}}})
 
     def __init__(self, url):
-        super(AbemaTV, self).__init__(url)
+        super().__init__(url)
         self.session.http.headers.update({'User-Agent': useragents.CHROME})
 
     def _generate_applicationkeysecret(self, deviceid):
@@ -198,7 +197,11 @@ class AbemaTV(Plugin):
             res = self.session.http.get(self._PRGM_API.format(vid),
                                         headers=auth_header)
             jsonres = self.session.http.json(res, schema=self._PRGM_SCHEMA)
-            return jsonres["label"].get("free", False) is True
+            playable = False
+            for item in jsonres["terms"]:
+                if item.get("onDemandType", False) == 3:
+                    playable = True
+            return playable
         elif vtype == "slots":
             res = self.session.http.get(self._SLOTS_API.format(vid),
                                         headers=auth_header)
@@ -214,7 +217,7 @@ class AbemaTV(Plugin):
         jsonres = self.session.http.json(res, schema=self._USER_SCHEMA)
         self.usertoken = jsonres['token']  # for authorzation
 
-        matchresult = self._url_re.match(self.url)
+        matchresult = self.match
         if matchresult.group("onair"):
             onair = matchresult.group("onair")
             if onair == "news-global":
@@ -248,11 +251,7 @@ class AbemaTV(Plugin):
                                 AbemaTVLicenseAdapter(self.session, deviceid,
                                                       self.usertoken))
 
-        streams = HLSStream.parse_variant_playlist(self.session, playlisturl)
-        if not streams:
-            return {"live": HLSStream(self.session, playlisturl)}
-        else:
-            return streams
+        return AbemaTVHLSStream.parse_variant_playlist(self.session, playlisturl)
 
 
 __plugin__ = AbemaTV

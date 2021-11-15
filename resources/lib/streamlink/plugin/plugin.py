@@ -3,14 +3,15 @@ import logging
 import operator
 import re
 import time
+from collections import OrderedDict
+from functools import partial
+from typing import Any, Callable, ClassVar, Dict, List, Match, NamedTuple, Optional, Pattern, Sequence, Type
+
 import requests.cookies
 
-from functools import partial
-from streamlink.compat import OrderedDict
-
 from streamlink.cache import Cache
-from streamlink.exceptions import PluginError, NoStreamsError, FatalPluginError
-from streamlink.options import Options, Arguments
+from streamlink.exceptions import FatalPluginError, NoStreamsError, PluginError
+from streamlink.options import Arguments, Options
 
 log = logging.getLogger(__name__)
 
@@ -56,7 +57,7 @@ def stream_weight(stream):
         if stream in weights:
             return weights[stream], group
 
-    match = re.match(r"^(\d+)([kp])?(\d+)?(\+)?(?:[a_](\d+)k)?(?:_(alt)(\d)?)?$", stream)
+    match = re.match(r"^(\d+)(k|p)?(\d+)?(\+)?(?:[a_](\d+)k)?(?:_(alt)(\d)?)?$", stream)
 
     if match:
         weight = 0
@@ -135,15 +136,11 @@ def stream_sorting_filter(expr, stream_weight):
     return func
 
 
-def parse_url_params(url):
-    split = url.split(" ", 1)
-    url = split[0]
-    params = split[1] if len(split) > 1 else ''
-    return url, parse_params(params)
-
-
-def parse_params(params):
+def parse_params(params: Optional[str] = None) -> Dict[str, Any]:
     rval = {}
+    if not params:
+        return rval
+
     matches = re.findall(PARAMS_REGEX, params)
 
     for key, value in matches:
@@ -157,7 +154,7 @@ def parse_params(params):
     return rval
 
 
-class UserInputRequester(object):
+class UserInputRequester:
     """
     Base Class / Interface for requesting user input
 
@@ -184,11 +181,31 @@ class UserInputRequester(object):
         raise NotImplementedError
 
 
-class Plugin(object):
+class Matcher(NamedTuple):
+    pattern: Pattern
+    priority: int
+
+
+class Plugin:
     """A plugin can retrieve stream information from the URL specified.
 
     :param url: URL that the plugin will operate on
     """
+
+    # the list of plugin matchers (URL pattern + priority)
+    # use the streamlink.plugin.pluginmatcher decorator for initializing this list
+    matchers: ClassVar[List[Matcher]] = None
+    # a tuple of `re.Match` results of all defined matchers
+    matches: Sequence[Optional[Match]]
+    # a reference to the compiled `re.Pattern` of the first matching matcher
+    matcher: Pattern
+    # a reference to the `re.Match` result of the first matching matcher
+    match: Match
+
+    # plugin metadata attributes
+    author: Optional[str] = None
+    category: Optional[str] = None
+    title: Optional[str] = None
 
     cache = None
     logger = None
@@ -196,13 +213,14 @@ class Plugin(object):
     options = Options()
     arguments = Arguments()
     session = None
+    _url: str = None
     _user_input_requester = None
 
     @classmethod
     def bind(cls, session, module, user_input_requester=None):
         cls.cache = Cache(filename="plugin-cache.json",
                           key_prefix=module)
-        cls.logger = logging.getLogger("streamlink.plugin." + module)
+        cls.logger = logging.getLogger("streamlink.plugins." + module)
         cls.module = module
         cls.session = session
         if user_input_requester is not None:
@@ -211,16 +229,25 @@ class Plugin(object):
             else:
                 raise RuntimeError("user-input-requester must be an instance of UserInputRequester")
 
-    def __init__(self, url):
+    @property
+    def url(self) -> str:
+        return self._url
+
+    @url.setter
+    def url(self, value: str):
+        self._url = value
+
+        matches = [(pattern, pattern.match(value)) for pattern, priority in self.matchers or []]
+        self.matches = tuple(m for p, m in matches)
+        self.matcher, self.match = next(((p, m) for p, m in matches if m is not None), (None, None))
+
+    def __init__(self, url: str) -> None:
         self.url = url
+
         try:
             self.load_cookies()
         except RuntimeError:
             pass  # unbound cannot load
-
-    @classmethod
-    def can_handle_url(cls, url):
-        raise NotImplementedError
 
     @classmethod
     def set_option(cls, key, value):
@@ -240,7 +267,7 @@ class Plugin(object):
 
     @classmethod
     def default_stream_types(cls, streams):
-        stream_types = ["rtmp", "hls", "hds", "http"]
+        stream_types = ["hls", "http"]
 
         for name, stream in iterate_streams(streams):
             stream_type = type(stream).shortname()
@@ -267,15 +294,6 @@ class Plugin(object):
             return func
 
         return decorator
-
-    @classmethod
-    def priority(cls, url):
-        """
-        Return the plugin priority for a given URL, by default it returns
-        NORMAL priority.
-        :return: priority level
-        """
-        return NORMAL_PRIORITY
 
     def streams(self, stream_types=None, sorting_excludes=None):
         """Attempts to extract available streams.
@@ -323,7 +341,7 @@ class Plugin(object):
                 ostreams = list(ostreams)
         except NoStreamsError:
             return {}
-        except (IOError, OSError, ValueError) as err:
+        except (OSError, ValueError) as err:
             raise PluginError(err)
 
         if not ostreams:
@@ -370,8 +388,7 @@ class Plugin(object):
             if match:
                 name = match.group(1)
             else:
-                self.logger.debug("The stream '{0}' has been ignored "
-                                  "since it is badly named.", name)
+                self.logger.debug(f"The stream '{name}' has been ignored since it is badly named.")
                 continue
 
             # Force lowercase name and replace space with underscore.
@@ -413,14 +430,21 @@ class Plugin(object):
     def _get_streams(self):
         raise NotImplementedError
 
-    def get_title(self):
-        return None
+    def get_metadata(self) -> Dict[str, Optional[str]]:
+        return dict(
+            author=self.get_author(),
+            category=self.get_category(),
+            title=self.get_title()
+        )
 
-    def get_author(self):
-        return None
+    def get_title(self) -> Optional[str]:
+        return None if self.title is None else str(self.title).strip()
 
-    def get_category(self):
-        return None
+    def get_author(self) -> Optional[str]:
+        return None if self.author is None else str(self.author).strip()
+
+    def get_category(self) -> Optional[str]:
+        return None if self.category is None else str(self.category).strip()
 
     def save_cookies(self, cookie_filter=None, default_expires=60 * 60 * 24 * 7):
         """
@@ -468,7 +492,7 @@ class Plugin(object):
         :return: list of the restored cookie names
         """
         if not self.session or not self.cache:
-            raise RuntimeError("Cannot loaded cached cookies in unbound plugin")
+            raise RuntimeError("Cannot load cached cookies in unbound plugin")
 
         restored = []
 
@@ -492,7 +516,7 @@ class Plugin(object):
         :return: list of the removed cookie names
         """
         if not self.session or not self.cache:
-            raise RuntimeError("Cannot loaded cached cookies in unbound plugin")
+            raise RuntimeError("Cannot clear cached cookies in unbound plugin")
 
         cookie_filter = cookie_filter or (lambda c: True)
         removed = []
@@ -511,7 +535,7 @@ class Plugin(object):
         if self._user_input_requester:
             try:
                 return self._user_input_requester.ask(prompt)
-            except IOError as e:
+            except OSError as e:
                 raise FatalPluginError("User input error: {0}".format(e))
             except NotImplementedError:  # ignore this and raise a FatalPluginError
                 pass
@@ -521,11 +545,30 @@ class Plugin(object):
         if self._user_input_requester:
             try:
                 return self._user_input_requester.ask_password(prompt)
-            except IOError as e:
+            except OSError as e:
                 raise FatalPluginError("User input error: {0}".format(e))
             except NotImplementedError:  # ignore this and raise a FatalPluginError
                 pass
         raise FatalPluginError("This plugin requires user input, however it is not supported on this platform")
 
 
-__all__ = ["Plugin"]
+def pluginmatcher(pattern: Pattern, priority: int = NORMAL_PRIORITY) -> Callable[[Type[Plugin]], Type[Plugin]]:
+    matcher = Matcher(pattern, priority)
+
+    def decorator(cls: Type[Plugin]) -> Type[Plugin]:
+        if not issubclass(cls, Plugin):
+            raise TypeError(f"{repr(cls)} is not a Plugin")
+        if cls.matchers is None:
+            cls.matchers = []
+        cls.matchers.insert(0, matcher)
+
+        return cls
+
+    return decorator
+
+
+__all__ = [
+    "HIGH_PRIORITY", "NORMAL_PRIORITY", "LOW_PRIORITY", "NO_PRIORITY",
+    "Plugin",
+    "Matcher", "pluginmatcher",
+]

@@ -1,16 +1,21 @@
+import logging
 import re
 
-from streamlink.plugin import Plugin
+from streamlink.plugin import Plugin, pluginmatcher
 from streamlink.plugin.api import validate
-from streamlink.stream import HLSStream, HTTPStream
-from streamlink.utils import parse_json
+from streamlink.stream.hls import HLSStream
+from streamlink.stream.http import HTTPStream
+
+log = logging.getLogger(__name__)
 
 
+@pluginmatcher(re.compile(
+    r'https?://replay\.gulli\.fr/(?:Direct|.+/(?P<video_id>VOD\d+))'
+))
 class Gulli(Plugin):
     LIVE_PLAYER_URL = 'https://replay.gulli.fr/jwplayer/embedstreamtv'
     VOD_PLAYER_URL = 'https://replay.gulli.fr/jwplayer/embed/{0}'
 
-    _url_re = re.compile(r'https?://replay\.gulli\.fr/(?:Direct|.+/(?P<video_id>VOD[0-9]+))')
     _playlist_re = re.compile(r'sources: (\[.+?\])', re.DOTALL)
     _vod_video_index_re = re.compile(r'jwplayer\(idplayer\).playlistItem\((?P<video_index>[0-9]+)\)')
     _mp4_bitrate_re = re.compile(r'.*_(?P<bitrate>[0-9]+)\.mp4')
@@ -19,7 +24,7 @@ class Gulli(Plugin):
         validate.all(
             validate.transform(lambda x: re.sub(r'"?file"?:\s*[\'"](.+?)[\'"],?', r'"file": "\1"', x, flags=re.DOTALL)),
             validate.transform(lambda x: re.sub(r'"?\w+?"?:\s*function\b.*?(?<={).*(?=})', "", x, flags=re.DOTALL)),
-            validate.transform(parse_json),
+            validate.parse_json(),
             [
                 validate.Schema({
                     'file': validate.url()
@@ -28,13 +33,8 @@ class Gulli(Plugin):
         )
     )
 
-    @classmethod
-    def can_handle_url(cls, url):
-        return Gulli._url_re.match(url)
-
     def _get_streams(self):
-        match = self._url_re.match(self.url)
-        video_id = match.group('video_id')
+        video_id = self.match.group('video_id')
         if video_id is not None:
             # VOD
             live = False
@@ -67,8 +67,7 @@ class Gulli(Plugin):
 
             try:
                 if '.m3u8' in video_url:
-                    for stream in HLSStream.parse_variant_playlist(self.session, video_url).items():
-                        yield stream
+                    yield from HLSStream.parse_variant_playlist(self.session, video_url).items()
                 elif '.mp4' in video_url:
                     match = self._mp4_bitrate_re.match(video_url)
                     if match is not None:
@@ -76,9 +75,9 @@ class Gulli(Plugin):
                     else:
                         bitrate = 'vod'
                     yield bitrate, HTTPStream(self.session, video_url)
-            except IOError as err:
+            except OSError as err:
                 if '403 Client Error' in str(err):
-                    self.logger.error('Failed to access stream, may be due to geo-restriction')
+                    log.error('Failed to access stream, may be due to geo-restriction')
                 raise
 
 

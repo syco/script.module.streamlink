@@ -2,15 +2,7 @@
 
 Streamlink library packed for Kodi: [Upstream link](https://github.com/streamlink/streamlink)
 
-You can install it from [repository.twilight0.libs](https://github.com/Twilight0/repo.twilight0.libs)
-
-Add this to your repository xml in order to pull updates:
-
-    <dir>
-        <info compressed="false">http://raw.githubusercontent.com/Twilight0/repo.twilight0.libs/master/_zips/addons.xml</info>
-        <checksum>http://raw.githubusercontent.com/Twilight0/repo.twilight0.libs/master/_zips/addons.xml.md5</checksum>
-        <datadir zip="true">http://raw.githubusercontent.com/Twilight0/repo.twilight0.libs/master/_zips/</datadir>
-    </dir>
+You can install it from [repository.Syco](https://syco.github.io/Cool-Stuff/repo/)
 
 ## Extracting streams
 ### The simplest use of the Streamlink API looks like this:

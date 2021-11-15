@@ -1,22 +1,31 @@
+import hashlib
 import logging
 import re
-from streamlink.utils import websocket
 
-from streamlink import logger
 from streamlink.buffers import RingBuffer
-from streamlink.compat import urlparse, unquote_plus
-from streamlink.plugin import Plugin, PluginError
-from streamlink.plugin.api import useragents
-from streamlink.plugin.api import validate
-from streamlink.stream import Stream
+from streamlink.plugin import Plugin, PluginArgument, PluginArguments, PluginError, pluginmatcher
+from streamlink.plugin.api import useragents, validate
+from streamlink.plugin.api.websocket import WebsocketClient
+from streamlink.stream.stream import Stream
 from streamlink.stream.stream import StreamIO
-from threading import Thread, Event
+from streamlink.utils.url import update_qsd
+
 
 log = logging.getLogger(__name__)
 
 
+@pluginmatcher(re.compile(
+    r"https?://twitcasting\.tv/(?P<channel>[^/]+)"
+))
 class TwitCasting(Plugin):
-    _url_re = re.compile(r"http(s)?://twitcasting.tv/(?P<channel>[^/]+)", re.VERBOSE)
+    arguments = PluginArguments(
+        PluginArgument(
+            "password",
+            sensitive=True,
+            metavar="PASSWORD",
+            help="Password for private Twitcasting streams."
+        )
+    )
     _STREAM_INFO_URL = "https://twitcasting.tv/streamserver.php?target={channel}&mode=client"
     _STREAM_REAL_URL = "{proto}://{host}/ws.app/stream/{movie_id}/fmp4/bd/1/1500?mode={mode}"
 
@@ -34,14 +43,9 @@ class TwitCasting(Plugin):
     })
 
     def __init__(self, url):
-        Plugin.__init__(self, url)
-        match = self._url_re.match(url).groupdict()
-        self.channel = match.get("channel")
+        super().__init__(url)
+        self.channel = self.match.group("channel")
         self.session.http.headers.update({'User-Agent': useragents.CHROME})
-
-    @classmethod
-    def can_handle_url(cls, url):
-        return cls._url_re.match(url) is not None
 
     def _get_streams(self):
         stream_info = self._get_stream_info()
@@ -66,6 +70,12 @@ class TwitCasting(Plugin):
             raise PluginError("No stream available for user {}".format(self.channel))
 
         real_stream_url = self._STREAM_REAL_URL.format(proto=proto, host=host, movie_id=movie_id, mode=mode)
+
+        password = self.options.get("password")
+        if password is not None:
+            password_hash = hashlib.md5(password.encode()).hexdigest()
+            real_stream_url = update_qsd(real_stream_url, {"word": password_hash})
+
         log.debug("Real stream url: {}".format(real_stream_url))
 
         return {mode: TwitCastingStream(session=self.session, url=real_stream_url)}
@@ -76,125 +86,62 @@ class TwitCasting(Plugin):
         return self.session.http.json(res, schema=self._STREAM_INFO_SCHEMA)
 
 
-class TwitCastingWsClient(Thread):
-    """
-    Recieve stream data from TwitCasting server via WebSocket.
-    """
-    def __init__(self, url, buffer, proxy=""):
-        Thread.__init__(self)
-        self.stopped = Event()
-        self.url = url
+class TwitCastingWsClient(WebsocketClient):
+    def __init__(self, buffer: RingBuffer, *args, **kwargs):
         self.buffer = buffer
-        self.proxy = proxy
-        self.ws = None
+        super().__init__(*args, **kwargs)
 
-    @staticmethod
-    def parse_proxy_url(purl):
-        """
-        Credit: streamlink/plugins/ustreamtv.py:UHSClient:parse_proxy_url()
-        """
-        proxy_options = {}
-        if purl:
-            p = urlparse(purl)
-            proxy_options['proxy_type'] = p.scheme
-            proxy_options['http_proxy_host'] = p.hostname
-            if p.port:
-                proxy_options['http_proxy_port'] = p.port
-            if p.username:
-                proxy_options['http_proxy_auth'] = (unquote_plus(p.username), unquote_plus(p.password or ""))
-        return proxy_options
+    def on_close(self, *args, **kwargs):
+        super().on_close(*args, **kwargs)
+        self.buffer.close()
 
-    def stop(self):
-        if not self.stopped.wait(0):
-            log.debug("Stopping WebSocket client...")
-            self.stopped.set()
-            self.ws.close()
-
-    def run(self):
-        if self.stopped.wait(0):
-            return
-
-        def on_message(ws, data):
-            if not self.stopped.wait(0):
-                try:
-                    self.buffer.write(data)
-                except Exception as err:
-                    log.error(err)
-                    self.stop()
-
-        def on_error(ws, error):
-            log.error(error)
-
-        def on_close(ws):
-            log.debug("Disconnected from WebSocket server")
-
-        # Parse proxy string for websocket-client
-        proxy_options = self.parse_proxy_url(self.proxy)
-        if proxy_options.get('http_proxy_host'):
-            log.debug("Connecting to {0} via proxy ({1}://{2}:{3})".format(
-                self.url,
-                proxy_options.get('proxy_type') or "http",
-                proxy_options.get('http_proxy_host'),
-                proxy_options.get('http_proxy_port') or 80
-            ))
-        else:
-            log.debug("Connecting to {0} without proxy".format(self.url))
-
-        # Connect to WebSocket server
-        self.ws = websocket.WebSocketApp(
-            self.url,
-            header=["User-Agent: {0}".format(useragents.CHROME)],
-            on_message=on_message,
-            on_error=on_error,
-            on_close=on_close
-        )
-        self.ws.run_forever(origin="https://twitcasting.tv/", **proxy_options)
+    def on_message(self, wsapp, data: str) -> None:
+        try:
+            self.buffer.write(data)
+        except Exception as err:
+            log.error(err)
+            self.close()
 
 
 class TwitCastingReader(StreamIO):
-    def __init__(self, stream, timeout=None, **kwargs):
-        StreamIO.__init__(self)
-        self.stream = stream
+    def __init__(self, stream: "TwitCastingStream", timeout=None):
+        super().__init__()
         self.session = stream.session
-        self.timeout = timeout if timeout else self.session.options.get("stream-timeout")
-        self.buffer = None
+        self.stream = stream
+        self.timeout = timeout or self.session.options.get("stream-timeout")
 
-        if logger.root.level <= logger.DEBUG:
-            websocket.enableTrace(True, log)
-
-    def open(self):
-        # Prepare buffer
         buffer_size = self.session.get_option("ringbuffer-size")
         self.buffer = RingBuffer(buffer_size)
 
-        log.debug("Starting WebSocket client")
-        self.client = TwitCastingWsClient(
-            self.stream.url,
-            buffer=self.buffer,
-            proxy=self.session.get_option("http-proxy")
+        self.wsclient = TwitCastingWsClient(
+            self.buffer,
+            stream.session,
+            stream.url,
+            origin="https://twitcasting.tv/"
         )
-        self.client.setDaemon(True)
-        self.client.start()
+
+    def open(self):
+        self.wsclient.start()
 
     def close(self):
-        self.client.stop()
+        self.wsclient.close()
         self.buffer.close()
 
     def read(self, size):
-        if not self.buffer:
-            return b""
-
-        return self.buffer.read(size, block=(not self.client.stopped.wait(0)),
-                                timeout=self.timeout)
+        return self.buffer.read(
+            size,
+            block=self.wsclient.is_alive(),
+            timeout=self.timeout
+        )
 
 
 class TwitCastingStream(Stream):
     def __init__(self, session, url):
-        super(TwitCastingStream, self).__init__(session)
+        super().__init__(session)
         self.url = url
 
     def __repr__(self):
-        return "<TwitCastingStream({0!r})>".format(self.url)
+        return f"<TwitCastingStream({self.url!r})>"
 
     def open(self):
         reader = TwitCastingReader(self)

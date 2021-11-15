@@ -1,25 +1,19 @@
 import logging
 import re
 
-from streamlink.plugin import Plugin
-from streamlink.plugin.api import useragents
-from streamlink.stream import HLSStream
+from streamlink.plugin import Plugin, pluginmatcher
+from streamlink.stream.hls import HLSStream
 
 log = logging.getLogger(__name__)
 
 
+@pluginmatcher(re.compile(
+    r'https?://(?:www\.)?sportal\.bg/sportal_live_tv\.php'
+))
 class Sportal(Plugin):
-
-    _url_re = re.compile(
-        r'https?://(?:www\.)?sportal\.bg/sportal_live_tv.php.*')
     _hls_re = re.compile(r'''["'](?P<url>[^"']+\.m3u8[^"']*?)["']''')
 
-    @classmethod
-    def can_handle_url(cls, url):
-        return cls._url_re.match(url) is not None
-
     def _get_streams(self):
-        self.session.http.headers.update({'User-Agent': useragents.FIREFOX})
         res = self.session.http.get(self.url)
         m = self._hls_re.search(res.text)
         if not m:

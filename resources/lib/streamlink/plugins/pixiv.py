@@ -1,23 +1,18 @@
-# -*- coding: utf-8 -*-
-from __future__ import unicode_literals
-
-import argparse
 import logging
 import re
 
 from streamlink.exceptions import FatalPluginError, NoStreamsError, PluginError
-from streamlink.plugin import Plugin, PluginArguments, PluginArgument
-from streamlink.plugin.api import useragents, validate
-from streamlink.stream import HLSStream
-from streamlink.utils.encoding import maybe_decode
+from streamlink.plugin import Plugin, PluginArgument, PluginArguments, pluginmatcher
+from streamlink.plugin.api import validate
+from streamlink.stream.hls import HLSStream
 
 log = logging.getLogger(__name__)
 
 
+@pluginmatcher(re.compile(
+    r"https?://sketch\.pixiv\.net/@?(?P<user>[^/]+)"
+))
 class Pixiv(Plugin):
-    """Plugin for https://sketch.pixiv.net/lives"""
-
-    _url_re = re.compile(r"https?://sketch\.pixiv\.net/@?(?P<user>[^/]+)")
     _post_key_re = re.compile(
         r"""name=["']post_key["']\svalue=["'](?P<data>[^"']+)["']""")
 
@@ -25,8 +20,7 @@ class Pixiv(Plugin):
         {
             "user": {
                 "unique_name": validate.text,
-                "name": validate.all(validate.text,
-                                     validate.transform(maybe_decode))
+                "name": validate.text
             },
             validate.optional("hls_movie"): {
                 "url": validate.text
@@ -58,8 +52,6 @@ class Pixiv(Plugin):
     login_url_post = "https://accounts.pixiv.net/api/login"
 
     arguments = PluginArguments(
-        PluginArgument("username", help=argparse.SUPPRESS),
-        PluginArgument("password", help=argparse.SUPPRESS),
         PluginArgument(
             "sessionid",
             requires=["devicetoken"],
@@ -95,17 +87,10 @@ class Pixiv(Plugin):
     )
 
     def __init__(self, url):
-        super(Pixiv, self).__init__(url)
+        super().__init__(url)
         self._authed = (self.session.http.cookies.get("PHPSESSID")
                         and self.session.http.cookies.get("device_token"))
-        self.session.http.headers.update({
-            "User-Agent": useragents.FIREFOX,
-            "Referer": self.url
-        })
-
-    @classmethod
-    def can_handle_url(cls, url):
-        return cls._url_re.match(url) is not None
+        self.session.http.headers.update({"Referer": self.url})
 
     def _login_using_session_id_and_device_token(self, session_id, device_token):
         self.session.http.get(self.login_url_get)
@@ -118,17 +103,18 @@ class Pixiv(Plugin):
 
     def hls_stream(self, hls_url):
         log.debug("URL={0}".format(hls_url))
-        for s in HLSStream.parse_variant_playlist(self.session, hls_url).items():
-            yield s
+        yield from HLSStream.parse_variant_playlist(self.session, hls_url).items()
 
     def get_streamer_data(self):
-        res = self.session.http.get(self.api_lives)
+        headers = {
+            "X-Requested-With": "https://sketch.pixiv.net/lives",
+        }
+        res = self.session.http.get(self.api_lives, headers=headers)
         data = self.session.http.json(res, schema=self._data_lives_schema)
         log.debug("Found {0} streams".format(len(data)))
 
-        m = self._url_re.match(self.url)
         for item in data:
-            if item["owner"]["user"]["unique_name"] == m.group("user"):
+            if item["owner"]["user"]["unique_name"] == self.match.group("user"):
                 return item
 
         raise NoStreamsError(self.url)

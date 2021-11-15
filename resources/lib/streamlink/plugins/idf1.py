@@ -1,17 +1,18 @@
-
 import re
 
-from streamlink.plugin import Plugin
+from streamlink.plugin import Plugin, pluginmatcher
 from streamlink.plugin.api import useragents, validate
-from streamlink.stream import HLSStream
-from streamlink.utils import parse_json, update_scheme
+from streamlink.stream.hls import HLSStream
+from streamlink.utils.url import update_scheme
 
 
+@pluginmatcher(re.compile(
+    r'https?://www\.idf1\.fr/(videos/[^/]+/[^/]+\.html|live\b)'
+))
 class IDF1(Plugin):
     DACAST_API_URL = 'https://json.dacast.com/b/{}/{}/{}'
     DACAST_TOKEN_URL = 'https://services.dacast.com/token/i/b/{}/{}/{}'
 
-    _url_re = re.compile(r'https?://www\.idf1\.fr/(videos/[^/]+/[^/]+\.html|live\b)')
     _video_id_re = re.compile(r"""
             dacast\('(?P<broadcaster_id>\d+)_(?P<video_type>[a-z]+)_(?P<video_id>\d+)',\s*'replay_content',\s*data\);
         """, re.VERBOSE)
@@ -23,7 +24,7 @@ class IDF1(Plugin):
     _player_url = 'http://ssl.p.jwpcdn.com/player/v/7.12.6/jwplayer.flash.swf'
 
     _api_schema = validate.Schema(
-        validate.transform(parse_json),
+        validate.parse_json(),
         {
             validate.optional('html5'): validate.all(
                 [
@@ -41,16 +42,12 @@ class IDF1(Plugin):
     )
 
     _token_schema = validate.Schema(
-        validate.transform(parse_json),
+        validate.parse_json(),
         {'token': validate.text},
         validate.get('token')
     )
 
     _user_agent = useragents.IE_11
-
-    @classmethod
-    def can_handle_url(cls, url):
-        return IDF1._url_re.match(url)
 
     def _get_streams(self):
         res = self.session.http.get(self.url)
@@ -82,8 +79,7 @@ class IDF1(Plugin):
 
             # Ignore HDS streams (broken)
             if '.m3u8' in video_url:
-                for s in HLSStream.parse_variant_playlist(self.session, video_url).items():
-                    yield s
+                yield from HLSStream.parse_variant_playlist(self.session, video_url).items()
 
 
 __plugin__ = IDF1

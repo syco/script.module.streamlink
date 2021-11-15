@@ -11,25 +11,25 @@ Following channels are working:
 
 Additionally, videos from iVysilani archive should work as well.
 """
+import json
 import logging
 import re
-import json
+from html import unescape as html_unescape
+from urllib.parse import quote
 
-from streamlink.plugin import Plugin
+from streamlink.plugin import Plugin, PluginError, pluginmatcher
 from streamlink.plugin.api import useragents, validate
-from streamlink.stream import HLSStream, DASHStream
-from streamlink.exceptions import PluginError
-from streamlink.compat import html_unescape, quote
+from streamlink.stream.dash import DASHStream
+from streamlink.stream.hls import HLSStream
 
 log = logging.getLogger(__name__)
 
 
+@pluginmatcher(re.compile(
+    r'https?://([\w-]+\.)*ceskatelevize\.cz'
+))
 class Ceskatelevize(Plugin):
-
     ajax_url = 'https://www.ceskatelevize.cz/ivysilani/ajax/get-client-playlist'
-    _url_re = re.compile(
-        r'http(s)?://([^.]*.)?ceskatelevize.cz'
-    )
     _player_re = re.compile(
         r'ivysilani/embed/iFramePlayer[^"]+'
     )
@@ -55,10 +55,6 @@ class Ceskatelevize(Plugin):
             }
         }]
     })
-
-    @classmethod
-    def can_handle_url(cls, url):
-        return cls._url_re.match(url)
 
     def _get_streams(self):
         self.session.http.headers.update({'User-Agent': useragents.IPAD})
@@ -159,7 +155,7 @@ class Ceskatelevize(Plugin):
         return 'http://ceskatelevize.cz/' + url
 
 
-class CeskatelevizeAPI2(object):
+class CeskatelevizeAPI2:
     _player_api = 'https://playlist.ceskatelevize.cz/'
     _url_re = re.compile(r'http(s)?://([^.]*.)?ceskatelevize.cz')
     _playlist_info_re = re.compile(r'{\s*"type":\s*"([a-z]+)",\s*"id":\s*"(\w+)"')
@@ -261,8 +257,7 @@ class CeskatelevizeAPI2(object):
         json_data = self.session.http.json(response, schema=self._playlist_schema)
         log.trace('{0!r}'.format(json_data))
         playlist = json_data['RESULT']['playlist'][0]['streamUrls']['main']
-        for s in DASHStream.parse_manifest(self.session, playlist).items():
-            yield s
+        yield from DASHStream.parse_manifest(self.session, playlist).items()
 
 
 __plugin__ = Ceskatelevize

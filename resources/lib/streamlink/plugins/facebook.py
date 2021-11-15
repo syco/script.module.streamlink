@@ -1,19 +1,23 @@
 import logging
 import re
+from html import unescape as html_unescape
+from urllib.parse import unquote_plus, urlencode
 
-from streamlink.compat import bytes, is_py3, html_unescape, unquote_plus, urlencode
-from streamlink.plugin import Plugin
-from streamlink.plugin.api import useragents
+from streamlink.plugin import Plugin, pluginmatcher
 from streamlink.plugin.api.utils import itertags
-from streamlink.stream import DASHStream, HTTPStream
-from streamlink.utils import parse_json
+from streamlink.stream.dash import DASHStream
+from streamlink.stream.http import HTTPStream
+from streamlink.utils.parse import parse_json
 
 log = logging.getLogger(__name__)
 
 
+@pluginmatcher(re.compile(r"""
+    https?://(?:www\.)?facebook
+    (?:\.com|wkhpilnemxj7asaniu7vnjjbiltxjqhye3mhbshg7kx5tfyd\.onion)
+    /[^/]+/(?:posts|videos)/(?P<video_id>\d+)
+""", re.VERBOSE))
 class Facebook(Plugin):
-    _url_re = re.compile(r'''(?x)https?://(?:www\.)?facebook(?:\.com|corewwwi.onion)
-        /[^/]+/(?:posts|videos)/(?P<video_id>[0-9]+)''')
     _src_re = re.compile(r'''(sd|hd)_src["']?\s*:\s*(?P<quote>["'])(?P<url>.+?)(?P=quote)''')
     _dash_manifest_re = re.compile(r'''dash_manifest["']?\s*:\s*["'](?P<manifest>.+?)["'],''')
     _playlist_re = re.compile(r'''video:\[({url:".+?}\])''')
@@ -25,10 +29,6 @@ class Facebook(Plugin):
     _DEFAULT_PC = "PHASED:DEFAULT"
     _DEFAULT_REV = 4681796
     _TAHOE_URL = "https://www.facebook.com/video/tahoe/async/{0}/?chain=true&isvideo=true&payloadtype=primary"
-
-    @classmethod
-    def can_handle_url(cls, url):
-        return cls._url_re.match(url) is not None
 
     def get_title(self):
         res = self.session.http.get(self.url)
@@ -61,8 +61,7 @@ class Facebook(Plugin):
                 # if the URL is json encoded, decode it
                 stream_url = parse_json("\"{}\"".format(stream_url))
             if ".mpd" in stream_url:
-                for s in DASHStream.parse_manifest(self.session, stream_url).items():
-                    yield s
+                yield from DASHStream.parse_manifest(self.session, stream_url).items()
             elif ".mp4" in stream_url:
                 yield match.group(1), HTTPStream(self.session, stream_url)
             else:
@@ -72,21 +71,25 @@ class Facebook(Plugin):
         if match:
             # facebook replaces "<" characters with the substring "\\x3C"
             manifest = match.group("manifest").replace("\\/", "/")
-            if is_py3:
-                manifest = bytes(unquote_plus(manifest), "utf-8").decode("unicode_escape")
-            else:
-                manifest = unquote_plus(manifest).decode("string_escape")
+            manifest = bytes(unquote_plus(manifest), "utf-8").decode("unicode_escape")
             # Ignore unsupported manifests until DASH SegmentBase support is implemented
             if "SegmentBase" in manifest:
                 log.error("Skipped DASH manifest with SegmentBase streams")
             else:
-                for s in DASHStream.parse_manifest(self.session, manifest).items():
-                    yield s
+                yield from DASHStream.parse_manifest(self.session, manifest).items()
 
     def _get_streams(self):
-        self.session.http.headers.update({'User-Agent': useragents.CHROME})
+        self.session.set_option("ffmpeg-start-at-zero", True)
+        self.session.http.headers.update({"Accept-Language": "en-US"})
+
         done = False
         res = self.session.http.get(self.url)
+        log.trace(f"{res.url}")
+        for title in itertags(res.text, "title"):
+            if title.text.startswith("Log into Facebook"):
+                log.error("Video is not available, You must log in to continue.")
+                return
+
         for s in self._parse_streams(res):
             done = True
             yield s
@@ -106,7 +109,7 @@ class Facebook(Plugin):
 
         # fallback to tahoe player url
         log.debug("Falling back to tahoe player")
-        video_id = self._url_re.match(self.url).group("video_id")
+        video_id = self.match.group("video_id")
         url = self._TAHOE_URL.format(video_id)
         data = {
             "__a": 1,

@@ -1,61 +1,68 @@
 import re
+from urllib.parse import urlparse
 
-from streamlink.plugin import Plugin
+from streamlink.plugin import Plugin, pluginmatcher
 from streamlink.plugin.api import validate
-from streamlink.stream import HLSStream, HTTPStream
+from streamlink.stream.hls import HLSStream
+from streamlink.stream.http import HTTPStream
 from streamlink.utils.url import update_scheme
 
 
+@pluginmatcher(re.compile(
+    r'https?://(?:(?P<subdomain>\w+)\.)?euronews\.com/'
+))
 class Euronews(Plugin):
-    _url_re = re.compile(r'(?P<scheme>https?)://(?P<subdomain>\w+)\.?euronews.com/(?P<path>live|.*)')
-    _re_vod = re.compile(r'<meta\s+property="og:video"\s+content="(http.*?)"\s*/>')
-    _live_api_url = "http://{0}.euronews.com/api/watchlive.json"
-    _live_schema = validate.Schema({
-        u"url": validate.url()
-    })
-    _stream_api_schema = validate.Schema({
-        u'status': u'ok',
-        u'primary': validate.url(),
-        validate.optional(u'backup'): validate.url()
-    })
-
-    @classmethod
-    def can_handle_url(cls, url):
-        return cls._url_re.match(url)
+    API_URL = "https://{subdomain}.euronews.com/api/watchlive.json"
 
     def _get_vod_stream(self):
-        """
-        Find the VOD video url
-        :return: video url
-        """
-        res = self.session.http.get(self.url)
-        video_urls = self._re_vod.findall(res.text)
-        if len(video_urls):
-            return dict(vod=HTTPStream(self.session, video_urls[0]))
+        root = self.session.http.get(self.url, schema=validate.Schema(
+            validate.parse_html()
+        ))
 
-    def _get_live_streams(self, match):
-        """
-        Get the live stream in a particular language
-        :param match:
-        :return:
-        """
-        live_url = self._live_api_url.format(match.get("subdomain"))
-        live_res = self.session.http.json(self.session.http.get(live_url), schema=self._live_schema)
+        video_url = root.xpath("string(.//meta[@property='og:video'][1]/@content)")
+        if video_url:
+            return dict(vod=HTTPStream(self.session, video_url))
 
-        api_url = update_scheme("{0}:///".format(match.get("scheme")), live_res["url"])
-        api_res = self.session.http.json(self.session.http.get(api_url), schema=self._stream_api_schema)
+        video_id = root.xpath("string(.//div[@data-google-src]/@data-video-id)")
+        if video_id:
+            return self.session.streams(f"https://www.youtube.com/watch?v={video_id}")
 
-        return HLSStream.parse_variant_playlist(self.session, api_res["primary"])
+        video_url = root.xpath("string(.//iframe[@id='pfpPlayer'][starts-with(@src,'https://www.youtube.com/')][1]/@src)")
+        if video_url:
+            return self.session.streams(video_url)
+
+    def _get_live_streams(self):
+        video_id = self.session.http.get(self.url, schema=validate.Schema(
+            validate.parse_html(),
+            validate.xml_xpath_string(".//div[@data-google-src]/@data-video-id")
+        ))
+
+        if video_id:
+            return self.session.streams(f"https://www.youtube.com/watch?v={video_id}")
+
+        info_url = self.session.http.get(self.API_URL.format(subdomain=self.match.group("subdomain")), schema=validate.Schema(
+            validate.parse_json(),
+            {"url": validate.url()},
+            validate.get("url"),
+            validate.transform(lambda url: update_scheme("https://", url))
+        ))
+        hls_url = self.session.http.get(info_url, schema=validate.Schema(
+            validate.parse_json(),
+            {
+                "status": "ok",
+                "protocol": "hls",
+                "primary": validate.url()
+            },
+            validate.get("primary")
+        ))
+
+        return HLSStream.parse_variant_playlist(self.session, hls_url)
 
     def _get_streams(self):
-        """
-        Find the streams for euronews
-        :return:
-        """
-        match = self._url_re.match(self.url).groupdict()
+        parsed = urlparse(self.url)
 
-        if match.get("path") == "live":
-            return self._get_live_streams(match)
+        if parsed.path == "/live":
+            return self._get_live_streams()
         else:
             return self._get_vod_stream()
 

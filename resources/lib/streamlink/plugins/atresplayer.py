@@ -1,19 +1,20 @@
-from __future__ import print_function
-
 import logging
 import re
-from functools import partial
 
-from streamlink.plugin import Plugin
+from streamlink.plugin import Plugin, pluginmatcher
 from streamlink.plugin.api import validate
-from streamlink.stream import HLSStream, DASHStream
-from streamlink.utils import parse_json, update_scheme, search_dict
+from streamlink.stream.dash import DASHStream
+from streamlink.stream.hls import HLSStream
+from streamlink.utils.data import search_dict
+from streamlink.utils.url import update_scheme
 
 log = logging.getLogger(__name__)
 
 
+@pluginmatcher(re.compile(
+    r"https?://(?:www\.)?atresplayer\.com/"
+))
 class AtresPlayer(Plugin):
-    url_re = re.compile(r"https?://(?:www.)?atresplayer.com/")
     state_re = re.compile(r"""window.__PRELOADED_STATE__\s*=\s*({.*?});""", re.DOTALL)
     channel_id_schema = validate.Schema(
         validate.transform(state_re.search),
@@ -21,8 +22,8 @@ class AtresPlayer(Plugin):
             None,
             validate.all(
                 validate.get(1),
-                validate.transform(parse_json),
-                validate.transform(partial(search_dict, key="href")),
+                validate.parse_json(),
+                validate.transform(search_dict, key="href"),
             )
         )
     )
@@ -30,13 +31,13 @@ class AtresPlayer(Plugin):
         validate.any(
             None,
             validate.all(
-                validate.transform(parse_json),
-                validate.transform(partial(search_dict, key="urlVideo")),
+                validate.parse_json(),
+                validate.transform(search_dict, key="urlVideo"),
             )
         )
     )
     stream_schema = validate.Schema(
-        validate.transform(parse_json),
+        validate.parse_json(),
         {"sources": [
             validate.all({
                 "src": validate.url(),
@@ -44,13 +45,9 @@ class AtresPlayer(Plugin):
             })
         ]}, validate.get("sources"))
 
-    @classmethod
-    def can_handle_url(cls, url):
-        return cls.url_re.match(url) is not None
-
     def __init__(self, url):
         # must be HTTPS
-        super(AtresPlayer, self).__init__(update_scheme("https://", url))
+        super().__init__(update_scheme("https://", url))
 
     def _get_streams(self):
         api_urls = self.session.http.get(self.url, schema=self.channel_id_schema)
@@ -67,11 +64,9 @@ class AtresPlayer(Plugin):
                     if not streams:
                         yield "live", HLSStream(self.session, source["src"])
                     else:
-                        for s in streams.items():
-                            yield s
+                        yield from streams.items()
                 elif source["type"] == "application/dash+xml":
-                    for s in DASHStream.parse_manifest(self.session, source["src"]).items():
-                        yield s
+                    yield from DASHStream.parse_manifest(self.session, source["src"]).items()
 
 
 __plugin__ = AtresPlayer

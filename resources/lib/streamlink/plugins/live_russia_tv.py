@@ -1,24 +1,22 @@
 import logging
 import re
+from urllib.parse import parse_qsl, urlparse
 
-from streamlink.compat import parse_qsl, urlparse
-from streamlink.plugin import Plugin
-from streamlink.plugin.api import useragents
+from streamlink.plugin import Plugin, pluginmatcher
 from streamlink.plugin.api.utils import itertags
-from streamlink.stream import HLSStream, HTTPStream
+from streamlink.stream.hls import HLSStream
+from streamlink.stream.http import HTTPStream
 
 log = logging.getLogger(__name__)
 
 
+@pluginmatcher(re.compile(
+    r"https?://(?:live\.)?russia\.tv/(?:channel/(?P<channel>\d+))?"
+))
 class LiveRussia(Plugin):
-    url_re = re.compile(r'https?://(?:live\.)?russia\.tv/(?:channel/(?P<channel>[0-9]+))?')
     _data_re = re.compile(r"""window\.pl\.data\.([\w_]+)\s*=\s*['"]?(.*?)['"]?;""")
 
     DATA_LIVE_URL = 'https:{domain}/iframe/datalive/id/{id}/sid/{sid}'
-
-    @classmethod
-    def can_handle_url(cls, url):
-        return cls.url_re.match(url) is not None
 
     def _get_iframe_url(self, url):
         res = self.session.http.get(url)
@@ -46,10 +44,9 @@ class LiveRussia(Plugin):
             return self.DATA_LIVE_URL.format(**args)
 
     def _get_streams(self):
-        self.session.http.headers.update({"User-Agent": useragents.FIREFOX})
         info_url = None
 
-        channel = self.url_re.match(self.url).group('channel')
+        channel = self.match.group('channel')
         if channel:
             log.debug('Channel: {0}'.format(channel))
             API_URL = 'https://live.russia.tv/api/now/channel/{0}'
@@ -84,8 +81,7 @@ class LiveRussia(Plugin):
                         if media_type == 'm3u8':
                             hls_url = media['sources'][media_type]['auto']
                             log.debug('hls_url={0}'.format(hls_url))
-                            for s in HLSStream.parse_variant_playlist(self.session, hls_url).items():
-                                yield s
+                            yield from HLSStream.parse_variant_playlist(self.session, hls_url).items()
                         elif media_type == 'http':
                             for pix, http_url in media['sources'][media_type].items():
                                 log.debug('http_url={0}'.format(http_url))

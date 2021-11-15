@@ -1,34 +1,36 @@
 import logging
 import re
+from urllib.parse import urlparse, urlunparse
 
-from streamlink.compat import urlparse, urlunparse
-from streamlink.plugin import Plugin
+from streamlink.plugin import Plugin, pluginmatcher
 from streamlink.plugin.api import validate
-from streamlink.stream import HLSStream
-from streamlink.utils import parse_json
-
+from streamlink.stream.hls import HLSStream
 
 log = logging.getLogger(__name__)
 
 
-class RaiPlay(Plugin):
-    _re_url = re.compile(r"https?://(?:www\.)?raiplay\.it/dirette/(\w+)/?")
+class RaiPlayHLSStream(HLSStream):
+    @classmethod
+    def _get_variant_playlist(cls, res):
+        res.encoding = "UTF-8"
+        return super()._get_variant_playlist(res)
 
+
+@pluginmatcher(re.compile(
+    r"https?://(?:www\.)?raiplay\.it/dirette/(\w+)/?"
+))
+class RaiPlay(Plugin):
     _re_data = re.compile(r"data-video-json\s*=\s*\"([^\"]+)\"")
     _schema_data = validate.Schema(
         validate.transform(_re_data.search),
         validate.any(None, validate.get(1))
     )
     _schema_json = validate.Schema(
-        validate.transform(parse_json),
+        validate.parse_json(),
         validate.get("video"),
         validate.get("content_url"),
         validate.url()
     )
-
-    @classmethod
-    def can_handle_url(cls, url):
-        return cls._re_url.match(url) is not None
 
     def _get_streams(self):
         json_url = self.session.http.get(self.url, schema=self._schema_data)
@@ -47,8 +49,7 @@ class RaiPlay(Plugin):
             log.error("Geo-restricted content")
             return
 
-        for stream in HLSStream.parse_variant_playlist(self.session, stream_url).items():
-            yield stream
+        yield from RaiPlayHLSStream.parse_variant_playlist(self.session, stream_url).items()
 
 
 __plugin__ = RaiPlay

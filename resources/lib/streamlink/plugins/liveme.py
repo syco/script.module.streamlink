@@ -1,15 +1,20 @@
+import logging
 import random
 import re
+from urllib.parse import parse_qsl, urlparse
 
-from streamlink.plugin import Plugin
+from streamlink.plugin import Plugin, pluginmatcher
 from streamlink.plugin.api import validate
-from streamlink.compat import urlparse, parse_qsl
-from streamlink.stream import HLSStream
-from streamlink.stream import HTTPStream
+from streamlink.stream.hls import HLSStream
+from streamlink.stream.http import HTTPStream
+
+log = logging.getLogger(__name__)
 
 
+@pluginmatcher(re.compile(
+    r"https?://(www\.)?liveme\.com/live\.html\?videoid=(\d+)"
+))
 class LiveMe(Plugin):
-    url_re = re.compile(r"https?://(www.)?liveme\.com/live\.html\?videoid=(\d+)")
     api_url = "https://live.ksmobile.net/live/queryinfo"
     api_schema = validate.Schema(validate.all({
         "status": "200",
@@ -20,10 +25,6 @@ class LiveMe(Plugin):
             }
         }
     }, validate.get("data")))
-
-    @classmethod
-    def can_handle_url(cls, url):
-        return cls.url_re.match(url) is not None
 
     def _random_t(self, t):
         return "".join(random.choice("ABCDEFGHJKMNPQRSTWXYZabcdefhijkmnprstwxyz2345678") for _ in range(t))
@@ -47,7 +48,7 @@ class LiveMe(Plugin):
                 'h5': 1,
                 'vali': vali
             }
-            self.logger.debug("Found Video ID: {0}".format(video_id))
+            log.debug("Found Video ID: {0}".format(video_id))
             res = self.session.http.post(self.api_url, data=data)
             data = self.session.http.json(res, schema=self.api_schema)
             hls = self._make_stream(data["video_info"]["hlsvideosource"])

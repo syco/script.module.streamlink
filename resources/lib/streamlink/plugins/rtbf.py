@@ -1,21 +1,30 @@
 import datetime
+import logging
 import re
+from html import unescape as html_unescape
 
-from streamlink.plugin import Plugin
+from streamlink.plugin import Plugin, pluginmatcher
 from streamlink.plugin.api import validate
-from streamlink.stream import DASHStream, HLSStream, HTTPStream
-from streamlink.utils import parse_json
-from streamlink.compat import html_unescape
+from streamlink.stream.dash import DASHStream
+from streamlink.stream.hls import HLSStream
+from streamlink.stream.http import HTTPStream
+
+log = logging.getLogger(__name__)
 
 
+@pluginmatcher(re.compile(r'''
+    https?://(?:www\.)?
+    (?:
+        rtbf\.be/auvio/.*\?l?id=(?P<video_id>\d+)#?
+        |
+        rtbfradioplayer\.be/radio/liveradio/.+
+    )
+''', re.VERBOSE))
 class RTBF(Plugin):
     GEO_URL = 'https://www.rtbf.be/api/geoloc'
     TOKEN_URL = 'https://token.rtbf.be/'
     RADIO_STREAM_URL = 'http://www.rtbfradioplayer.be/radio/liveradio/rtbf/radios/{}/config.json'
 
-    _url_re = re.compile(
-        r'https?://(?:www\.)?(?:rtbf\.be/auvio/.*\?l?id=(?P<video_id>[0-9]+)#?|rtbfradioplayer\.be/radio/liveradio/.+)'
-    )
     _stream_size_re = re.compile(
         r'https?://.+-(?P<size>\d+p?)\..+?$'
     )
@@ -45,7 +54,7 @@ class RTBF(Plugin):
             validate.all(
                 validate.get(1),
                 validate.transform(html_unescape),
-                validate.transform(parse_json),
+                validate.parse_json(),
                 {
                     'geoLocRestriction': validate.text,
                     validate.optional('isLive'): bool,
@@ -97,10 +106,6 @@ class RTBF(Plugin):
         return datetime.datetime.strptime(date[:-6], '%Y-%m-%dT%H:%M:%S') + \
             datetime.timedelta(hours=int(date[-6:-3]), minutes=int(date[-2:]))
 
-    @classmethod
-    def can_handle_url(cls, url):
-        return RTBF._url_re.match(url)
-
     def _get_radio_streams(self):
         res = self.session.http.get(self.url)
         match = self._radio_id_re.search(res.text)
@@ -130,12 +135,12 @@ class RTBF(Plugin):
 
         # Check geolocation to prevent further errors when stream is parsed
         if not self.check_geolocation(stream_data['geoLocRestriction']):
-            self.logger.error('Stream is geo-restricted')
+            log.error('Stream is geo-restricted')
             return
 
         # Check whether streams are DRM-protected
         if stream_data.get('drm', False):
-            self.logger.error('Stream is DRM-protected')
+            log.error('Stream is DRM-protected')
             return
 
         now = datetime.datetime.now()
@@ -158,30 +163,27 @@ class RTBF(Plugin):
                 if stream_data.get('isLive', False):
                     # Live streams require a token
                     hls_url = self.tokenize_stream(hls_url)
-                for stream in HLSStream.parse_variant_playlist(self.session, hls_url).items():
-                    yield stream
+                yield from HLSStream.parse_variant_playlist(self.session, hls_url).items()
 
             dash_url = stream_data.get('urlDash') or stream_data.get('streamUrlDash')
             if dash_url:
                 if stream_data.get('isLive', False):
                     # Live streams require a token
                     dash_url = self.tokenize_stream(dash_url)
-                for stream in DASHStream.parse_manifest(self.session, dash_url).items():
-                    yield stream
+                yield from DASHStream.parse_manifest(self.session, dash_url).items()
 
-        except IOError as err:
+        except OSError as err:
             if '403 Client Error' in str(err):
                 # Check whether video is expired
                 if 'startDate' in stream_data:
                     if now < self.iso8601_to_epoch(stream_data['startDate']):
-                        self.logger.error('Stream is not yet available')
+                        log.error('Stream is not yet available')
                 elif 'endDate' in stream_data:
                     if now > self.iso8601_to_epoch(stream_data['endDate']):
-                        self.logger.error('Stream has expired')
+                        log.error('Stream has expired')
 
     def _get_streams(self):
-        match = self.can_handle_url(self.url)
-        if match.group('video_id'):
+        if self.match.group('video_id'):
             return self._get_video_streams()
         return self._get_radio_streams()
 

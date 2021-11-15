@@ -1,20 +1,19 @@
-# -*- coding: utf-8 -*-
 import logging
 import re
 
-from streamlink.plugin import Plugin, PluginError
-from streamlink.stream import HLSStream
+from streamlink.plugin import Plugin, PluginError, pluginmatcher
 from streamlink.plugin.api import validate
+from streamlink.stream.hls import HLSStream
 
 log = logging.getLogger(__name__)
 
 
+@pluginmatcher(re.compile(
+    r"https?://(?:www\.)?ccma\.cat/tv3/directe/(.+?)/"
+))
 class TV3Cat(Plugin):
-    _url_re = re.compile(r"http://(?:www.)?ccma.cat/tv3/directe/(.+?)/")
-    _stream_info_url = (
-        "http://dinamics.ccma.cat/pvideo/media.jsp?media=video&version=0s&idint={ident}&"
-        "profile=pc&desplacament=0"
-    )
+    _stream_info_url = "http://dinamics.ccma.cat/pvideo/media.jsp" \
+                       "?media=video&version=0s&idint={ident}&profile=pc&desplacament=0"
     _media_schema = validate.Schema({
         "geo": validate.text,
         "url": validate.url(scheme=validate.any("http", "https"))
@@ -26,14 +25,9 @@ class TV3Cat(Plugin):
         validate.transform(lambda x: x if isinstance(x, list) else [x])
     )
 
-    @classmethod
-    def can_handle_url(cls, url):
-        return cls._url_re.match(url) is not None
-
     def _get_streams(self):
-        match = self._url_re.match(self.url)
-        if match:
-            ident = match.group(1)
+        if self.match:
+            ident = self.match.group(1)
             data_url = self._stream_info_url.format(ident=ident)
             stream_infos = self.session.http.json(self.session.http.get(data_url), schema=self._channel_schema)
 
@@ -42,7 +36,6 @@ class TV3Cat(Plugin):
                     return HLSStream.parse_variant_playlist(self.session, stream['url'], name_fmt="{pixels}_{bitrate}")
                 except PluginError:
                     log.debug("Failed to get streams for: {0}".format(stream['geo']))
-                    pass
 
 
 __plugin__ = TV3Cat

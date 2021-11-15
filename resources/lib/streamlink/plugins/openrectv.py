@@ -1,48 +1,43 @@
 import logging
 import re
 
-from streamlink.plugin import Plugin, PluginArgument, PluginArguments
+from streamlink.plugin import Plugin, PluginArgument, PluginArguments, pluginmatcher
 from streamlink.plugin.api import validate
-from streamlink.stream import HLSStream
-from streamlink.utils import parse_json
+from streamlink.stream.hls import HLSStream
 
 log = logging.getLogger(__name__)
 
 
+@pluginmatcher(re.compile(
+    r"https?://(?:www\.)?openrec\.tv/(?:live|movie)/(?P<id>[^/]+)"
+))
 class OPENRECtv(Plugin):
-    _url_re = re.compile(r"https?://(?:www\.)?openrec.tv/(?:live|movie)/(?P<id>[^/]+)")
     _stores_re = re.compile(r"window.stores\s*=\s*({.*?});", re.DOTALL | re.MULTILINE)
     _config_re = re.compile(r"window.sharedConfig\s*=\s*({.*?});", re.DOTALL | re.MULTILINE)
 
-    api_url = "https://apiv5.openrec.tv/api/v5/movies/{id}/detail"
+    movie_info_url = "https://public.openrec.tv/external/api/v5/movies/{id}"
+    subscription_info_url = "https://apiv5.openrec.tv/api/v5/movies/{id}/detail"
     login_url = "https://www.openrec.tv/viewapp/v4/mobile/user/login"
 
-    _config_schema = validate.Schema({
-        "urls": {
-            "apiv5Authorized": validate.url()
+    _info_schema = validate.Schema({
+        validate.optional("id"): validate.text,
+        validate.optional("title"): validate.text,
+        validate.optional("movie_type"): validate.text,
+        validate.optional("onair_status"): validate.any(None, int),
+        validate.optional("public_type"): validate.text,
+        validate.optional("media"): {
+            "url": validate.any(None, validate.url()),
+            "url_public": validate.any(None, validate.url()),
+            "url_ull": validate.any(None, validate.url()),
         }
     })
-    _stores_schema = validate.Schema({
-        "moviePageStore": {
-            "movieStore": {
-                "id": validate.text,
-                "title": validate.text,
-                "media": {
-                    "url": validate.any(None, '', validate.url())
-                }
-            }
-        }
-    }, validate.get("moviePageStore"), validate.get("movieStore"))
 
-    _detail_schema = validate.Schema({
-        validate.optional("error_message"): validate.text,
-        "status": int,
+    _subscription_schema = validate.Schema({
+        validate.optional("status"): int,
         validate.optional("data"): {
-            "type": validate.text,
             "items": [{
                 "media": {
-                    "url": validate.any(None, validate.url()),
-                    "url_dvr": validate.any(None, validate.url())
+                    "url": validate.any(None, validate.url())
                 }
             }]
         }
@@ -73,14 +68,8 @@ class OPENRECtv(Plugin):
     )
 
     def __init__(self, url):
-        super(OPENRECtv, self).__init__(url)
-        self._pdata = None
-        self._pres = None
-        self._pconfig = None
-
-    @classmethod
-    def can_handle_url(cls, url):
-        return cls._url_re.match(url) is not None
+        super().__init__(url)
+        self.video_id = None
 
     def login(self, email, password):
         res = self.session.http.post(self.login_url, data={"mail": email, "password": password})
@@ -91,42 +80,38 @@ class OPENRECtv(Plugin):
             log.error("Failed to login: {0}".format(data["error_message"]))
         return data["status"] == 0
 
-    def _get_page(self):
-        if not self._pres:
-            self._pres = self.session.http.get(self.url)
-        return self._pres
-
     def _get_movie_data(self):
-        pres = self._get_page()
-        match = self._stores_re.search(pres.text)
-        if match:
-            self._pdata = parse_json(match.group(1), schema=self._stores_schema)
-
-        return self._pdata
-
-    def _get_page_config(self):
-        pres = self._get_page()
-        match = self._config_re.search(pres.text)
-        if match:
-            self._pconfig = parse_json(match.group(1))
-
-        return self._pconfig
-
-    def _get_details(self, id):
-        config = self._get_page_config()
-        api_url = config["urls"]["apiv5Authorized"]
-        url = "{base}/movies/{id}/detail".format(base=api_url, id=id)
+        url = self.movie_info_url.format(id=self.video_id)
         res = self.session.http.get(url, headers={
             "access-token": self.session.http.cookies.get("access_token"),
             "uuid": self.session.http.cookies.get("uuid")
         })
-        data = self.session.http.json(res, schema=self._detail_schema)
+        data = self.session.http.json(res, schema=self._info_schema)
+
+        if data["id"]:
+            log.debug("Got valid detail response")
+            return data
+        else:
+            log.error("Failed to get video stream: {0}".format(data["message"]))
+
+    def _get_subscription_movie_data(self):
+        url = self.subscription_info_url.format(id=self.video_id)
+        res = self.session.http.get(url, headers={
+            "access-token": self.session.http.cookies.get("access_token"),
+            "uuid": self.session.http.cookies.get("uuid")
+        })
+        data = self.session.http.json(res, schema=self._subscription_schema)
 
         if data["status"] == 0:
-            log.debug("Got valid detail response")
-            return data["data"]
+            log.debug("Got valid subscription info")
+            return data
         else:
-            log.error("Failed to get video stream: {0}".format(data["error_message"]))
+            log.error("Failed to get video stream: {0}".format(data["message"]))
+
+    def get_author(self):
+        mdata = self._get_movie_data()
+        if mdata:
+            return mdata["channel"]["name"]
 
     def get_title(self):
         mdata = self._get_movie_data()
@@ -134,21 +119,38 @@ class OPENRECtv(Plugin):
             return mdata["title"]
 
     def _get_streams(self):
+        self.video_id = self.url.rsplit('/', 1)[-1]
+        if self.get_option("email") and self.get_option("password"):
+            self.login(self.get_option("email"), self.get_option("password"))
         mdata = self._get_movie_data()
+
         if mdata:
             log.debug("Found video: {0} ({1})".format(mdata["title"], mdata["id"]))
-            if mdata["media"]["url"]:
-                for s in HLSStream.parse_variant_playlist(self.session, mdata["media"]["url"]).items():
-                    yield s
-            elif self.get_option("email") and self.get_option("password"):
-                if self.login(self.get_option("email"), self.get_option("password")):
-                    details = self._get_details(mdata["id"])
-                    if details:
-                        for item in details["items"]:
-                            for s in HLSStream.parse_variant_playlist(self.session, item["media"]["url"]).items():
-                                yield s
+            m3u8_file = None
+            # subscription
+            if mdata["public_type"] == "member":
+                subs_data = self._get_subscription_movie_data()
+                m3u8_file = subs_data["data"]["items"][0]["media"]["url"]
+            # streaming
+            elif mdata["onair_status"] == 1:
+                m3u8_file = mdata["media"]["url_ull"]
+            # archive
+            elif mdata["onair_status"] == 2 and mdata["media"]["url_public"] is not None:
+                m3u8_file = mdata["media"]["url_public"].replace("public.m3u8", "playlist.m3u8")
+            # uploaded video
+            elif mdata["onair_status"] is None and mdata["movie_type"] == "2":
+                m3u8_file = mdata["media"]["url"]
             else:
-                log.error("You must login to access this stream")
+                log.error("There is no video file.")
+
+            if m3u8_file is not None:
+                yield from HLSStream.parse_variant_playlist(
+                    self.session,
+                    m3u8_file
+                ).items()
+
+        else:
+            log.error("You don't have the authority or no video file.")
 
 
 __plugin__ = OPENRECtv

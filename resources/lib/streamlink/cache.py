@@ -2,23 +2,19 @@ import json
 import os
 import shutil
 import tempfile
-import xbmc, xbmcvfs
-from time import time, mktime
+from time import mktime, time
 
-# from .compat import is_win32
-#
-#
-# if is_win32:
-#     xdg_cache = os.environ.get("APPDATA", os.path.expanduser("~"))
-# else:
-#     xdg_cache = os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
+from streamlink.compat import is_win32
 
-xdg_cache = tmp_dir = cache_dir = xbmc.translatePath('special://profile/addon_data/script.module.streamlink.base')
+if is_win32:
+    xdg_cache = os.environ.get("APPDATA", os.path.expanduser("~"))
+else:
+    xdg_cache = os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
 
-if not xbmcvfs.exists(tmp_dir):
-    xbmcvfs.mkdirs(tmp_dir)
+cache_dir = os.path.join(xdg_cache, "streamlink")
 
-class Cache(object):
+
+class Cache:
     """Caches Python values as JSON and prunes expired entries."""
 
     def __init__(self, filename, key_prefix=""):
@@ -42,7 +38,7 @@ class Cache(object):
         pruned = []
 
         for key, value in self._cache.items():
-            expires = value.get("expires", time())
+            expires = value.get("expires", now)
             if expires <= now:
                 pruned.append(key)
 
@@ -52,7 +48,7 @@ class Cache(object):
         return len(pruned) > 0
 
     def _save(self):
-        fd, tempname = tempfile.mkstemp(dir=tmp_dir)
+        fd, tempname = tempfile.mkstemp()
         fd = os.fdopen(fd, "w")
         json.dump(self._cache, fd, indent=2, separators=(",", ": "))
         fd.close()
@@ -63,7 +59,7 @@ class Cache(object):
                 os.makedirs(os.path.dirname(self.filename))
 
             shutil.move(tempname, self.filename)
-        except (IOError, OSError):
+        except OSError:
             os.remove(tempname)
 
     def set(self, key, value, expires=60 * 60 * 24 * 7, expires_at=None):
@@ -73,10 +69,13 @@ class Cache(object):
         if self.key_prefix:
             key = "{0}:{1}".format(self.key_prefix, key)
 
-        expires += time()
-
-        if expires_at:
-            expires = mktime(expires_at.timetuple())
+        if expires_at is None:
+            expires += time()
+        else:
+            try:
+                expires = mktime(expires_at.timetuple())
+            except OverflowError:
+                expires = 0
 
         self._cache[key] = dict(value=value, expires=expires)
         self._save()

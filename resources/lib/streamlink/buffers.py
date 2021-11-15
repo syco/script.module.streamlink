@@ -15,7 +15,7 @@ class Chunk(BytesIO):
         return self.tell() == self.length
 
 
-class Buffer(object):
+class Buffer:
     """Simple buffer for use in single-threaded consumer/filler.
 
     Stores chunks in a deque to avoid inefficient reallocating
@@ -33,8 +33,7 @@ class Buffer(object):
 
         while bytes_left:
             try:
-                current_chunk = (self.current_chunk or
-                                 Chunk(self.chunks.popleft()))
+                current_chunk = self.current_chunk or Chunk(self.chunks.popleft())
             except IndexError:
                 break
 
@@ -104,11 +103,8 @@ class RingBuffer(Buffer):
 
     def read(self, size=-1, block=True, timeout=None):
         if block and not self.closed:
-            self.event_used.wait(timeout)
-
-            # If the event is still not set it's a timeout
-            if not self.event_used.is_set() and self.length == 0:
-                raise IOError("Read timeout")
+            if not self.event_used.wait(timeout) and self.length == 0:
+                raise OSError("Read timeout")
 
         return self._read(size)
 

@@ -1,30 +1,26 @@
-# -*- coding: utf-8 -*-
 import re
 
-from streamlink.plugin import Plugin
+from streamlink.plugin import Plugin, pluginmatcher
 from streamlink.plugin.api import validate
-from streamlink.stream import HLSStream
+from streamlink.stream.hls import HLSStream
 
 
+@pluginmatcher(re.compile(
+    r"https?://(?:www\.)?tv360\.com\.tr/canli-yayin"
+))
 class TV360(Plugin):
-    url_re = re.compile(r"https?://(?:www.)?tv360.com.tr/canli-yayin")
-    hls_re = re.compile(r'''hls.loadSource\(["'](http.*m3u8)["']\)''', re.DOTALL)
+    hls_re = re.compile(r'''src="(http.*m3u8)"''')
 
     hls_schema = validate.Schema(
         validate.transform(hls_re.search),
-        validate.any(None, validate.all(validate.get(1)))
+        validate.any(None, validate.all(validate.get(1), validate.url()))
     )
 
-    @classmethod
-    def can_handle_url(cls, url):
-        return cls.url_re.match(url) is not None
-
     def _get_streams(self):
-        res = self.session.http.get(self.url)
-        hls_url = self.hls_re.search(res.text)
+        hls_url = self.session.http.get(self.url, schema=self.hls_schema)
 
         if hls_url:
-            return HLSStream.parse_variant_playlist(self.session, hls_url.group(1))
+            return HLSStream.parse_variant_playlist(self.session, hls_url)
 
 
 __plugin__ = TV360

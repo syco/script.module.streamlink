@@ -1,24 +1,17 @@
 import logging
 import re
 
-from streamlink.exceptions import PluginError
-from streamlink.plugin import Plugin
-from streamlink.plugin.api import useragents
-from streamlink.stream import HLSStream
+from streamlink.plugin import Plugin, PluginError, pluginmatcher
+from streamlink.stream.hls import HLSStream
 
 log = logging.getLogger(__name__)
 
 
+@pluginmatcher(re.compile(
+    r'https?://player\.stv\.tv/live'
+))
 class STV(Plugin):
-    _url_re = re.compile(r'https?://player\.stv\.tv/live')
-
     API_URL = 'https://player.api.stv.tv/v1/streams/stv/'
-
-    title = None
-
-    @classmethod
-    def can_handle_url(cls, url):
-        return cls._url_re.match(url) is not None
 
     def get_title(self):
         if self.title is None:
@@ -26,7 +19,6 @@ class STV(Plugin):
         return self.title
 
     def _get_api_results(self):
-        self.session.http.headers.update({'User-Agent': useragents.FIREFOX})
         res = self.session.http.get(self.API_URL)
         data = self.session.http.json(res)
 

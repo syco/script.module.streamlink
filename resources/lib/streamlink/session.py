@@ -1,112 +1,69 @@
-import imp
 import logging
 import pkgutil
-import sys
-import traceback
-import warnings
+from collections import OrderedDict
+from functools import lru_cache
+from socket import AF_INET, AF_INET6
+from typing import Dict, Optional, Tuple, Type
 
 import requests
+import requests.packages.urllib3.util.connection as urllib3_connection
+from requests.packages.urllib3.util.connection import allowed_gai_family
 
-from streamlink.logger import StreamlinkLogger, Logger
-from streamlink.utils import update_scheme, memoize
+from streamlink import __version__, plugins
+from streamlink.exceptions import NoPluginError, PluginError
+from streamlink.logger import StreamlinkLogger
+from streamlink.options import Options
+from streamlink.plugin.api.http_session import HTTPSession
+from streamlink.plugin.plugin import Matcher, NORMAL_PRIORITY, NO_PRIORITY, Plugin
 from streamlink.utils.l10n import Localization
-from . import plugins, __version__
-from .compat import is_win32, OrderedDict
-from .exceptions import NoPluginError, PluginError
-from .options import Options
-from .plugin import api
+from streamlink.utils.module import load_module
+from streamlink.utils.url import update_scheme
 
 # Ensure that the Logger class returned is Streamslink's for using the API (for backwards compatibility)
 logging.setLoggerClass(StreamlinkLogger)
 log = logging.getLogger(__name__)
 
 
-def print_small_exception(start_after):
-    type, value, traceback_ = sys.exc_info()
-
-    tb = traceback.extract_tb(traceback_)
-    index = 0
-
-    for i, trace in enumerate(tb):
-        if trace[2] == start_after:
-            index = i + 1
-            break
-
-    lines = traceback.format_list(tb[index:])
-    lines += traceback.format_exception_only(type, value)
-
-    for line in lines:
-        sys.stderr.write(line)
-
-    sys.stderr.write("\n")
-
-
 class PythonDeprecatedWarning(UserWarning):
     pass
 
 
-class Streamlink(object):
+class Streamlink:
     """A Streamlink session is used to keep track of plugins,
        options and log settings."""
 
     def __init__(self, options=None):
-        if sys.version_info[0] == 2:
-            warnings.warn(
-                "Python 2.7 has reached the end of its life.  A future version of streamlink will drop "
-                "support for Python 2.7. Please upgrade your Python to at least 3.5.",
-                category=PythonDeprecatedWarning,
-                stacklevel=2
-            )
-
-        self.http = api.HTTPSession()
+        self.http = HTTPSession()
         self.options = Options({
-            "hds-live-edge": 10.0,
-            "hds-segment-attempts": 3,
-            "hds-segment-threads": 1,
-            "hds-segment-timeout": 10.0,
-            "hds-timeout": 60.0,
+            "interface": None,
+            "ipv4": False,
+            "ipv6": False,
             "hls-live-edge": 3,
-            "hls-segment-attempts": 3,
-            "hls-segment-threads": 1,
-            "hls-segment-timeout": 10.0,
+            "hls-segment-ignore-names": [],
             "hls-segment-stream-data": False,
-            "hls-timeout": 60.0,
             "hls-playlist-reload-attempts": 3,
             "hls-playlist-reload-time": "default",
             "hls-start-offset": 0,
             "hls-duration": None,
-            "http-stream-timeout": 60.0,
             "ringbuffer-size": 1024 * 1024 * 16,  # 16 MB
-            "rtmp-timeout": 60.0,
-            "rtmp-rtmpdump": is_win32 and "rtmpdump.exe" or "rtmpdump",
-            "rtmp-proxy": None,
             "stream-segment-attempts": 3,
             "stream-segment-threads": 1,
             "stream-segment-timeout": 10.0,
             "stream-timeout": 60.0,
-            "subprocess-errorlog": False,
-            "subprocess-errorlog-path": None,
             "ffmpeg-ffmpeg": None,
-            "ffmpeg-video-transcode": "copy",
-            "ffmpeg-audio-transcode": "copy",
+            "ffmpeg-fout": None,
+            "ffmpeg-video-transcode": None,
+            "ffmpeg-audio-transcode": None,
+            "ffmpeg-copyts": False,
+            "ffmpeg-start-at-zero": False,
+            "mux-subtitles": False,
             "locale": None,
             "user-input-requester": None
         })
         if options:
             self.options.update(options)
-        self.plugins = OrderedDict({})
+        self.plugins: Dict[str, Type[Plugin]] = OrderedDict({})
         self.load_builtin_plugins()
-        self._logger = None
-
-    @property
-    def logger(self):
-        """
-        Backwards compatible logger property
-        :return: Logger instance
-        """
-        if not self._logger:
-            self._logger = Logger()
-        return self._logger
 
     def set_option(self, key, value):
         """Sets general options used by plugins and streams originating
@@ -119,39 +76,22 @@ class Streamlink(object):
         **Available options**:
 
         ======================== =========================================
-        hds-live-edge            ( float) Specify the time live HDS
-                                 streams will start from the edge of
-                                 stream, default: ``10.0``
-
-        hds-segment-attempts     (int) How many attempts should be done
-                                 to download each HDS segment, default: ``3``
-
-        hds-segment-threads      (int) The size of the thread pool used
-                                 to download segments, default: ``1``
-
-        hds-segment-timeout      (float) HDS segment connect and read
-                                 timeout, default: ``10.0``
-
-        hds-timeout              (float) Timeout for reading data from
-                                 HDS streams, default: ``60.0``
+        interface                (str) Set the network interface,
+                                 default: ``None``
+        ipv4                     (bool) Resolve address names to IPv4 only.
+                                 This option overrides ipv6, default: ``False``
+        ipv6                     (bool) Resolve address names to IPv6 only.
+                                 This option overrides ipv4, default: ``False``
 
         hls-live-edge            (int) How many segments from the end
                                  to start live streams on, default: ``3``
 
-        hls-segment-attempts     (int) How many attempts should be done
-                                 to download each HLS segment, default: ``3``
-
-        hls-segment-threads      (int) The size of the thread pool used
-                                 to download segments, default: ``1``
+        hls-segment-ignore-names (str[]) List of segment names without
+                                 file endings which should get filtered out,
+                                 default: ``[]``
 
         hls-segment-stream-data  (bool) Stream HLS segment downloads,
                                  default: ``False``
-
-        hls-segment-timeout      (float) HLS segment connect and read
-                                 timeout, default: ``10.0``
-
-        hls-timeout              (float) Timeout for reading data from
-                                 HLS streams, default: ``60.0``
 
         http-proxy               (str) Specify a HTTP proxy to use for
                                  all HTTP requests
@@ -188,28 +128,9 @@ class Streamlink(object):
                                  requests except the ones covered by
                                  other options, default: ``20.0``
 
-        http-stream-timeout      (float) Timeout for reading data from
-                                 HTTP streams, default: ``60.0``
-
-        subprocess-errorlog      (bool) Log errors from subprocesses to
-                                 a file located in the temp directory
-
-        subprocess-errorlog-path (str) Log errors from subprocesses to
-                                 a specific file
-
         ringbuffer-size          (int) The size of the internal ring
                                  buffer used by most stream types,
                                  default: ``16777216`` (16MB)
-
-        rtmp-proxy               (str) Specify a proxy (SOCKS) that RTMP
-                                 streams will use
-
-        rtmp-rtmpdump            (str) Specify the location of the
-                                 rtmpdump executable used by RTMP streams,
-                                 e.g. ``/usr/local/bin/rtmpdump``
-
-        rtmp-timeout             (float) Timeout for reading data from
-                                 RTMP streams, default: ``60.0``
 
         ffmpeg-ffmpeg            (str) Specify the location of the
                                  ffmpeg executable use by Muxing streams
@@ -221,6 +142,10 @@ class Streamlink(object):
         ffmpeg-verbose-path      (str) Specify the location of the
                                  ffmpeg stderr log file
 
+        ffmpeg-fout              (str) The output file format
+                                 when muxing with ffmpeg
+                                 e.g. ``matroska``
+
         ffmpeg-video-transcode   (str) The codec to use if transcoding
                                  video when muxing with ffmpeg
                                  e.g. ``h264``
@@ -229,25 +154,26 @@ class Streamlink(object):
                                  audio when muxing with ffmpeg
                                  e.g. ``aac``
 
+        ffmpeg-copyts            (bool) When used with ffmpeg, do not shift input timestamps.
+
+        ffmpeg-start-at-zero     (bool) When used with ffmpeg and copyts,
+                                 shift input timestamps so they start at zero
+                                 default: ``False``
+
+        mux-subtitles            (bool) Mux available subtitles into the
+                                 output stream.
+
         stream-segment-attempts  (int) How many attempts should be done
                                  to download each segment, default: ``3``.
-                                 General option used by streams not
-                                 covered by other options.
 
         stream-segment-threads   (int) The size of the thread pool used
                                  to download segments, default: ``1``.
-                                 General option used by streams not
-                                 covered by other options.
 
         stream-segment-timeout   (float) Segment connect and read
                                  timeout, default: ``10.0``.
-                                 General option used by streams not
-                                 covered by other options.
 
         stream-timeout           (float) Timeout for reading data from
                                  stream, default: ``60.0``.
-                                 General option used by streams not
-                                 covered by other options.
 
         locale                   (str) Locale setting, in the RFC 1766 format
                                  eg. en_US or es_ES
@@ -261,23 +187,34 @@ class Streamlink(object):
 
         """
 
-        # Backwards compatibility
-        if key == "rtmpdump":
-            key = "rtmp-rtmpdump"
-        elif key == "rtmpdump-proxy":
-            key = "rtmp-proxy"
-        elif key == "errorlog":
-            key = "subprocess-errorlog"
-        elif key == "errorlog-path":
-            key = "subprocess-errorlog-path"
+        if key == "interface":
+            for scheme, adapter in self.http.adapters.items():
+                if scheme not in ("http://", "https://"):
+                    continue
+                if not value:
+                    adapter.poolmanager.connection_pool_kw.pop("source_address")
+                else:
+                    adapter.poolmanager.connection_pool_kw.update(
+                        # https://docs.python.org/3/library/socket.html#socket.create_connection
+                        source_address=(value, 0)
+                    )
+            self.options.set(key, None if not value else value)
 
-        if key == "http-proxy":
-            self.http.proxies["http"] = update_scheme("http://", value)
-            if "https" not in self.http.proxies:
-                self.http.proxies["https"] = update_scheme("http://", value)
+        elif key == "ipv4" or key == "ipv6":
+            self.options.set(key, value)
+            if value:
+                self.options.set("ipv6" if key == "ipv4" else "ipv4", False)
+                urllib3_connection.allowed_gai_family = \
+                    (lambda: AF_INET) if key == "ipv4" else (lambda: AF_INET6)
+            else:
+                urllib3_connection.allowed_gai_family = allowed_gai_family
 
-        elif key == "https-proxy":
-            self.http.proxies["https"] = update_scheme("https://", value)
+        elif key in ("http-proxy", "https-proxy"):
+            self.http.proxies["http"] = update_scheme("https://", value, force=False)
+            self.http.proxies["https"] = self.http.proxies["http"]
+            if key == "https-proxy":
+                log.info("The https-proxy option has been deprecated in favour of a single http-proxy option")
+
         elif key == "http-cookies":
             if isinstance(value, dict):
                 self.http.cookies.update(value)
@@ -310,6 +247,20 @@ class Streamlink(object):
             self.http.cert = value
         elif key == "http-timeout":
             self.http.timeout = value
+
+        # deprecated: {dash,hls}-segment-attempts
+        elif key in ("dash-segment-attempts", "hls-segment-attempts"):
+            self.options.set("stream-segment-attempts", int(value))
+        # deprecated: {dash,hls}-segment-threads
+        elif key in ("dash-segment-threads", "hls-segment-threads"):
+            self.options.set("stream-segment-threads", int(value))
+        # deprecated: {dash,hls}-segment-timeout
+        elif key in ("dash-segment-timeout", "hls-segment-timeout"):
+            self.options.set("stream-segment-timeout", float(value))
+        # deprecated: {hls,dash,http-stream}-timeout
+        elif key in ("dash-timeout", "hls-timeout", "http-stream-timeout"):
+            self.options.set("stream-timeout", float(value))
+
         else:
             self.options.set(key, value)
 
@@ -319,13 +270,6 @@ class Streamlink(object):
         :param key: key of the option
 
         """
-        # Backwards compatibility
-        if key == "rtmpdump":
-            key = "rtmp-rtmpdump"
-        elif key == "rtmpdump-proxy":
-            key = "rtmp-proxy"
-        elif key == "errorlog":
-            key = "subprocess-errorlog"
 
         if key == "http-proxy":
             return self.http.proxies.get("http")
@@ -374,30 +318,11 @@ class Streamlink(object):
             plugin = self.plugins[plugin]
             return plugin.get_option(key)
 
-    def set_loglevel(self, level):
-        """Sets the log level used by this session.
-
-        Valid levels are: "none", "error", "warning", "info"
-        and "debug".
-
-        :param level: level of logging to output
-
-        """
-        self.logger.set_level(level)
-
-    def set_logoutput(self, output):
-        """Sets the log output used by this session.
-
-        :param output: a file-like object with a write method
-
-        """
-        self.logger.set_output(output)
-
-    @memoize
-    def resolve_url(self, url, follow_redirect=True):
+    @lru_cache(maxsize=128)
+    def resolve_url(self, url: str, follow_redirect: bool = True) -> Tuple[Type[Plugin], str]:
         """Attempts to find a plugin that can use this URL.
 
-        The default protocol (http) will be prefixed to the URL if
+        The default protocol (https) will be prefixed to the URL if
         not specified.
 
         Raises :exc:`NoPluginError` on failure.
@@ -406,20 +331,32 @@ class Streamlink(object):
         :param follow_redirect: follow redirects
 
         """
-        url = update_scheme("http://", url)
+        url = update_scheme("https://", url, force=False)
 
-        available_plugins = []
+        matcher: Matcher
+        candidate: Optional[Type[Plugin]] = None
+        priority = NO_PRIORITY
         for name, plugin in self.plugins.items():
-            if plugin.can_handle_url(url):
-                available_plugins.append(plugin)
+            if plugin.matchers:
+                for matcher in plugin.matchers:
+                    if matcher.priority > priority and matcher.pattern.match(url) is not None:
+                        candidate = plugin
+                        priority = matcher.priority
+            # TODO: remove deprecated plugin resolver
+            elif hasattr(plugin, "can_handle_url") and callable(plugin.can_handle_url) and plugin.can_handle_url(url):
+                prio = plugin.priority(url) if hasattr(plugin, "priority") and callable(plugin.priority) else NORMAL_PRIORITY
+                if prio > priority:
+                    log.info(f"Resolved plugin {name} with deprecated can_handle_url API")
+                    candidate = plugin
+                    priority = prio
 
-        available_plugins.sort(key=lambda x: x.priority(url), reverse=True)
-        if available_plugins:
-            return available_plugins[0](url)
+        if candidate:
+            return candidate, url
 
         if follow_redirect:
             # Attempt to handle a redirect URL
             try:
+                # noinspection PyArgumentList
                 res = self.http.head(url, allow_redirects=True, acceptable_status=[501])
 
                 # Fall back to GET request if server doesn't handle HEAD.
@@ -433,10 +370,10 @@ class Streamlink(object):
 
         raise NoPluginError
 
-    def resolve_url_no_redirect(self, url):
+    def resolve_url_no_redirect(self, url: str) -> Tuple[Type[Plugin], str]:
         """Attempts to find a plugin that can use this URL.
 
-        The default protocol (http) will be prefixed to the URL if
+        The default protocol (https) will be prefixed to the URL if
         not specified.
 
         Raises :exc:`NoPluginError` on failure.
@@ -446,7 +383,7 @@ class Streamlink(object):
         """
         return self.resolve_url(url, follow_redirect=False)
 
-    def streams(self, url, **params):
+    def streams(self, url: str, **params):
         """Attempts to find a plugin and extract streams from the *url*.
 
         *params* are passed to :func:`Plugin.streams`.
@@ -454,7 +391,9 @@ class Streamlink(object):
         Raises :exc:`NoPluginError` if no plugin is found.
         """
 
-        plugin = self.resolve_url(url)
+        pluginclass, resolved_url = self.resolve_url(url)
+        plugin = pluginclass(resolved_url)
+
         return plugin.streams(**params)
 
     def get_plugins(self):
@@ -465,46 +404,33 @@ class Streamlink(object):
     def load_builtin_plugins(self):
         self.load_plugins(plugins.__path__[0])
 
-    def load_plugins(self, path):
+    def load_plugins(self, path: str) -> bool:
         """Attempt to load plugins from the path specified.
 
         :param path: full path to a directory where to look for plugins
-
+        :return: success
         """
+        success = False
+        user_input_requester = self.get_option("user-input-requester")
         for loader, name, ispkg in pkgutil.iter_modules([path]):
-            file, pathname, desc = imp.find_module(name, [path])
             # set the full plugin module name
-            module_name = "streamlink.plugin.{0}".format(name)
-
+            module_name = f"streamlink.plugins.{name}"
             try:
-                self.load_plugin(module_name, file, pathname, desc)
-            except Exception:
-                sys.stderr.write("Failed to load plugin {0}:\n".format(name))
-                print_small_exception("load_plugin")
-
+                mod = load_module(module_name, path)
+            except ImportError:
+                log.exception(f"Failed to load plugin {name} from {path}\n")
                 continue
 
-    def load_plugin(self, name, file, pathname, desc):
-        # Set the global http session for this plugin
-        user_input_requester = self.get_option("user-input-requester")
-        api.http = self.http
-
-        module = imp.load_module(name, file, pathname, desc)
-
-        if hasattr(module, "__plugin__"):
-            module_name = getattr(module, "__name__")
-            plugin_name = module_name.split(".")[-1]  # get the plugin part of the module name
-
-            plugin = getattr(module, "__plugin__")
-            plugin.bind(self, plugin_name, user_input_requester)
-
+            if not hasattr(mod, "__plugin__") or not issubclass(mod.__plugin__, Plugin):
+                continue
+            success = True
+            plugin = mod.__plugin__
+            plugin.bind(self, name, user_input_requester)
             if plugin.module in self.plugins:
-                log.debug("Plugin {0} is being overridden by {1}".format(plugin.module, pathname))
-
+                log.debug(f"Plugin {plugin.module} is being overridden by {mod.__file__}")
             self.plugins[plugin.module] = plugin
 
-        if file:
-            file.close()
+        return success
 
     @property
     def version(self):

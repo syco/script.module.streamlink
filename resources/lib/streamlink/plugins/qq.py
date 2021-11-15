@@ -1,16 +1,19 @@
-# -*- coding: utf-8 -*-
+import logging
 import re
 
 from streamlink.exceptions import NoStreamsError
-from streamlink.plugin import Plugin
+from streamlink.plugin import Plugin, pluginmatcher
 from streamlink.plugin.api import validate
-from streamlink.plugin.api.utils import parse_json
-from streamlink.stream import HLSStream
+from streamlink.stream.hls import HLSStream
+from streamlink.utils.parse import parse_json
+
+log = logging.getLogger(__name__)
 
 
+@pluginmatcher(re.compile(
+    r"https?://(m\.)?live\.qq\.com/(?P<room_id>\d+)"
+))
 class QQ(Plugin):
-    """Streamlink Plugin for live.qq.com"""
-
     _data_schema = validate.Schema(
         {
             "data": {
@@ -24,18 +27,9 @@ class QQ(Plugin):
     api_url = "http://live.qq.com/api/h5/room?room_id={0}"
 
     _data_re = re.compile(r"""(?P<data>{.+})""")
-    _url_re = re.compile(r"""https?://(m\.)?live\.qq\.com/(?P<room_id>\d+)""")
-
-    @classmethod
-    def can_handle_url(cls, url):
-        return cls._url_re.match(url)
 
     def _get_streams(self):
-        match = self._url_re.match(self.url)
-        if not match:
-            return
-
-        room_id = match.group("room_id")
+        room_id = self.match.group("room_id")
         res = self.session.http.get(self.api_url.format(room_id))
 
         data = self._data_re.search(res.text)
@@ -47,7 +41,7 @@ class QQ(Plugin):
         except Exception:
             raise NoStreamsError(self.url)
 
-        self.logger.debug("URL={0}".format(hls_url))
+        log.debug("URL={0}".format(hls_url))
         return {"live": HLSStream(self.session, hls_url)}
 
 

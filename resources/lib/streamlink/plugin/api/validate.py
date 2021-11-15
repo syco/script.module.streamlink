@@ -16,26 +16,31 @@
 """
 
 
-from xml.etree import ElementTree as ET
 from copy import copy as copy_obj
+from functools import singledispatch
+from typing import Any, Tuple, Union
+from urllib.parse import urlparse
 
-try:
-    from functools import singledispatch
-except ImportError:
-    from streamlink.utils.singledispatch import singledispatch
+from xml.etree import ElementTree as ET
 
-from ...compat import is_py2, urlparse
-from ...exceptions import PluginError
+from streamlink.exceptions import PluginError
+from streamlink.utils.parse import (
+    parse_html as _parse_html,
+    parse_json as _parse_json,
+    parse_qsd as _parse_qsd,
+    parse_xml as _parse_xml
+)
+
 
 __all__ = [
     "any", "all", "filter", "get", "getattr", "hasattr", "length", "optional",
-    "transform", "text", "union", "url", "startswith", "endswith", "contains",
-    "xml_element", "xml_find", "xml_findall", "xml_findtext",
+    "transform", "text", "union", "union_get", "url", "startswith", "endswith", "contains",
+    "xml_element", "xml_find", "xml_findall", "xml_findtext", "xml_xpath", "xml_xpath_string",
+    "parse_json", "parse_html", "parse_xml", "parse_qsd",
     "validate", "Schema", "SchemaContainer"
 ]
 
-#: Alias for text type on each Python version
-text = is_py2 and basestring or str
+text = str
 
 # References to original functions that we override in this module
 _all = all
@@ -55,34 +60,30 @@ def _is_re_match(value):
 class any(tuple):
     """At least one of the schemas must be valid."""
     def __new__(cls, *args):
-        return super(any, cls).__new__(cls, args)
+        return super().__new__(cls, args)
 
 
 class all(tuple):
     """All schemas must be valid."""
     def __new__(cls, *args):
-        return super(all, cls).__new__(cls, args)
+        return super().__new__(cls, args)
 
 
-class SchemaContainer(object):
+class SchemaContainer:
     def __init__(self, schema):
         self.schema = schema
 
 
-class transform(object):
+class transform:
     """Applies function to value to transform it."""
 
-    def __init__(self, func):
-        # text is an alias for basestring on Python 2, which cannot be
-        # instantiated and therefore can't be used to transform the value,
-        # so we force to unicode instead.
-        if is_py2 and func == text:
-            func = unicode
-
+    def __init__(self, func, *args, **kwargs):
         self.func = func
+        self.args = args
+        self.kwargs = kwargs
 
 
-class optional(object):
+class optional:
     """An optional key used in a dict or union-dict."""
 
     def __init__(self, key):
@@ -97,13 +98,22 @@ class attr(SchemaContainer):
     """Validates an object's attributes."""
 
 
-class xml_element(object):
+class union_get:
+    def __init__(self, *keys, seq=tuple):
+        self.keys = keys
+        self.seq = seq
+
+
+class xml_element:
     """A XML element."""
 
     def __init__(self, tag=None, text=None, attrib=None):
         self.tag = tag
         self.text = text
         self.attrib = attrib
+
+
+# ----
 
 
 def length(length):
@@ -151,25 +161,36 @@ def contains(string):
     return contains_str
 
 
-def get(item, default=None):
+def get(item: Union[Any, Tuple[Any]], default: Any = None, strict: bool = False):
     """Get item from value (value[item]).
 
-    If the item is not found, return the default.
+    Unless strict is set to True, item can be a tuple of items for recursive lookups.
+
+    If the item is not found in the last object of a recursive lookup, return the default.
 
     Handles XML elements, regex matches and anything that has __getitem__.
     """
 
-    def getter(value):
-        if ET.iselement(value):
-            value = value.attrib
+    if type(item) is not tuple or strict:
+        item = (item,)
 
+    def getter(value):
+        idx = 0
         try:
-            # Use .group() if this is a regex match object
-            if _is_re_match(value):
-                return value.group(item)
-            else:
-                return value[item]
+            for key in item:
+                if ET.iselement(value):
+                    value = value.attrib[key]
+                # Use .group() if this is a regex match object
+                elif _is_re_match(value):
+                    value = value.group(key)
+                else:
+                    value = value[key]
+                idx += 1
+            return value
         except (KeyError, IndexError):
+            # only return default value on last item in nested lookup
+            if idx < len(item) - 1:
+                raise ValueError(f"Object \"{value}\" does not have item \"{key}\"")
             return default
         except (TypeError, AttributeError) as err:
             raise ValueError(err)
@@ -222,12 +243,6 @@ def map(func):
     Supports both dicts and sequences, key/value pairs are
     expanded when applied to a dict.
     """
-    # text is an alias for basestring on Python 2, which cannot be
-    # instantiated and therefore can't be used to transform the value,
-    # so we force to unicode instead.
-    if is_py2 and text == func:
-        func = unicode
-
     def expand_kv(kv):
         return func(*kv)
 
@@ -277,7 +292,7 @@ def xml_find(xpath):
         validate(ET.iselement, value)
         value = value.find(xpath)
         if value is None:
-            raise ValueError("XPath '{0}' did not return an element".format(xpath))
+            raise ValueError(f"XPath '{xpath}' did not return an element")
 
         return validate(ET.iselement, value)
 
@@ -299,6 +314,37 @@ def xml_findtext(xpath):
         xml_find(xpath),
         getattr("text"),
     )
+
+
+def xml_xpath(xpath):
+    def transform_xpath(value):
+        validate(ET.iselement, value)
+        return value.xpath(xpath) or None
+
+    return transform(transform_xpath)
+
+
+def xml_xpath_string(xpath):
+    return xml_xpath(f"string({xpath})")
+
+
+def parse_json(*args, **kwargs):
+    return transform(_parse_json, *args, **kwargs, exception=ValueError, schema=None)
+
+
+def parse_html(*args, **kwargs):
+    return transform(_parse_html, *args, **kwargs, exception=ValueError, schema=None)
+
+
+def parse_xml(*args, **kwargs):
+    return transform(_parse_xml, *args, **kwargs, exception=ValueError, schema=None)
+
+
+def parse_qsd(*args, **kwargs):
+    return transform(_parse_qsd, *args, **kwargs, exception=ValueError, schema=None)
+
+
+# ----
 
 
 @singledispatch
@@ -337,9 +383,9 @@ def validate_all(schemas, value):
 
 
 @validate.register(transform)
-def validate_transform(schema, value):
+def validate_transform(schema: transform, value):
     validate(callable, schema.func)
-    return schema.func(value)
+    return schema.func(value, *schema.args, **schema.kwargs)
 
 
 @validate.register(list)
@@ -393,26 +439,30 @@ def validate_type(schema, value):
 @validate.register(xml_element)
 def validate_xml_element(schema, value):
     validate(ET.iselement, value)
-    new = ET.Element(value.tag, attrib=value.attrib)
+    _tag = value.tag
+    _attrib = value.attrib
+    _text = value.text
 
     if schema.attrib is not None:
         try:
-            new.attrib = validate(schema.attrib, value.attrib)
+            _attrib = validate(schema.attrib, dict(value.attrib))
         except ValueError as err:
-            raise ValueError("Unable to validate XML attributes: {0}".format(err))
+            raise ValueError(f"Unable to validate XML attributes: {err}")
 
     if schema.tag is not None:
         try:
-            new.tag = validate(schema.tag, value.tag)
+            _tag = validate(schema.tag, value.tag)
         except ValueError as err:
-            raise ValueError("Unable to validate XML tag: {0}".format(err))
+            raise ValueError(f"Unable to validate XML tag: {err}")
 
     if schema.text is not None:
         try:
-            new.text = validate(schema.text, value.text)
+            _text = validate(schema.text, value.text)
         except ValueError as err:
-            raise ValueError("Unable to validate XML text: {0}".format(err))
+            raise ValueError(f"Unable to validate XML text: {err}")
 
+    new = ET.Element(_tag, attrib=_attrib)
+    new.text = _text
     for child in value:
         new.append(child)
 
@@ -432,6 +482,11 @@ def validate_attr(schema, value):
         setattr(new, attr, validate(schema, _getattr(value, attr)))
 
     return new
+
+
+@validate.register(union_get)
+def validate_union_from(schema, value):
+    return schema.seq(validate(get(k), value) for k in schema.keys)
 
 
 @singledispatch
@@ -471,7 +526,7 @@ def validate_unions(schema, value):
     return validate_union(schema.schema, value)
 
 
-class Schema(object):
+class Schema:
     """Wraps a validator schema into a object."""
 
     def __init__(self, *schemas):

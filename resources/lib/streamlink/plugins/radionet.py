@@ -1,17 +1,19 @@
 import logging
 import re
+from urllib.parse import urlparse, urlunparse
 
-from streamlink.compat import urlparse, urlunparse
-from streamlink.plugin import Plugin
+from streamlink.plugin import Plugin, pluginmatcher
 from streamlink.plugin.api import validate
-from streamlink.stream import HTTPStream, HLSStream
-from streamlink.utils import parse_json
+from streamlink.stream.hls import HLSStream
+from streamlink.stream.http import HTTPStream
 
 log = logging.getLogger(__name__)
 
 
+@pluginmatcher(re.compile(
+    r"https?://(\w+)\.radio\.(net|at|de|dk|es|fr|it|pl|pt|se)"
+))
 class RadioNet(Plugin):
-    _url_re = re.compile(r"https?://(\w+)\.radio\.(net|at|de|dk|es|fr|it|pl|pt|se)")
     _stream_data_re = re.compile(r'\bstation\s*:\s*(\{.+\}),?\s*')
 
     _stream_schema = validate.Schema(
@@ -20,7 +22,7 @@ class RadioNet(Plugin):
             None,
             validate.all(
                 validate.get(1),
-                validate.transform(parse_json),
+                validate.parse_json(),
                 {
                     'type': validate.text,
                     'streams': validate.all([{
@@ -31,10 +33,6 @@ class RadioNet(Plugin):
             )
         )
     )
-
-    @classmethod
-    def can_handle_url(cls, url):
-        return cls._url_re.match(url) is not None
 
     def _get_streams(self):
         streams = self.session.http.get(self.url, schema=self._stream_schema)
@@ -61,8 +59,7 @@ class RadioNet(Plugin):
                 if not streams:
                     yield stream["quality"], HLSStream(self.session, stream["url"])
                 else:
-                    for s in streams.items():
-                        yield s
+                    yield from streams.items()
 
 
 __plugin__ = RadioNet

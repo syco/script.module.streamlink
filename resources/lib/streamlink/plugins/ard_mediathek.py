@@ -1,10 +1,11 @@
 import logging
 import re
 
-from streamlink.plugin import Plugin
+from streamlink.plugin import Plugin, pluginmatcher
 from streamlink.plugin.api import validate
-from streamlink.stream import HLSStream, HTTPStream
-from streamlink.utils import update_scheme
+from streamlink.stream.hls import HLSStream
+from streamlink.stream.http import HTTPStream
+from streamlink.utils.url import update_scheme
 
 MEDIA_URL = "http://www.ardmediathek.de/play/media/{0}"
 QUALITY_MAP = {
@@ -16,7 +17,6 @@ QUALITY_MAP = {
     0: "144p"
 }
 
-_url_re = re.compile(r"https?://(?:(\w+\.)?ardmediathek\.de/|mediathek\.daserste\.de/)")
 _media_id_re = re.compile(r"/play/(?:media|config|sola)/(\d+)")
 _media_schema = validate.Schema({
     "_mediaArray": [{
@@ -31,11 +31,10 @@ _media_schema = validate.Schema({
 log = logging.getLogger(__name__)
 
 
-class ard_mediathek(Plugin):
-    @classmethod
-    def can_handle_url(cls, url):
-        return _url_re.match(url) is not None
-
+@pluginmatcher(re.compile(
+    r"https?://(?:(\w+\.)?ardmediathek\.de/|mediathek\.daserste\.de/)"
+))
+class ARDMediathek(Plugin):
     def _get_http_streams(self, info):
         name = QUALITY_MAP.get(info["_quality"], "vod")
         urls = info["_stream"]
@@ -81,10 +80,9 @@ class ard_mediathek(Plugin):
                     log.error("Unexpected stream type: '{0}'".format(stream_))
 
                 try:
-                    for s in parser(stream):
-                        yield s
-                except IOError as err:
+                    yield from parser(stream)
+                except OSError as err:
                     log.error("Failed to extract {0} streams: {1}".format(parser_name, err))
 
 
-__plugin__ = ard_mediathek
+__plugin__ = ARDMediathek
