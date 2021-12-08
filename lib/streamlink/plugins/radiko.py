@@ -8,7 +8,7 @@ from urllib.parse import urlencode
 from xml.etree import ElementTree as ET
 
 from streamlink.plugin import Plugin, pluginmatcher
-from streamlink.stream import HLSStream
+from streamlink.stream.hls import HLSStream
 
 
 @pluginmatcher(re.compile(
