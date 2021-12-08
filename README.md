@@ -56,6 +56,11 @@ sudo rm .bash_history
 sudo chown -R $(id -u).$(id -g) .
 find -type d -name __pycache__ | xargs -r rm -Rf
 
+
+####################################################################
+sed -i '/__version__/d' lib/pycountry/__init__.py
+
+####################################################################
 rm -Rf lib/lxml
 
 ## from xml.etree import ElementTree as ET
@@ -74,5 +79,7 @@ vim lib/streamlink/utils/parse.py
 
 
 grep --exclude-dir=.svn --exclude-dir=.git -RIls -m1 lxml
+
+####################################################################
 
 ```
